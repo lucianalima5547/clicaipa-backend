@@ -1,5 +1,8 @@
-// server.js — validação via /retorno + webhook que concilia (formatos novo e antigo)
-require('dotenv').config({ override: true });
+
+if (process.env.NODE_ENV !== 'production') {
+  require('dotenv').config(); // sem override
+}
+
 
 const path = require('path');
 const express = require('express');
@@ -11,17 +14,75 @@ const { MercadoPagoConfig, Preference, MerchantOrder } = mp;
 
 const app = express();
 
-/* -------------------- Middlewares base (uma vez só) -------------------- */
-app.use(cors({
-  origin: true,
-  methods: ['GET', 'POST', 'OPTIONS'],
-}));
-app.options(/.*/, cors()); // Express 5: preflight catch-all
+/* ======================== ENV & CONFIG ======================== */
+// Host público usado em notification_url e back_urls
+const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || 'https://clicaipa-backend.onrender.com')
+  .replace(/\/+$/, ''); // remove barra final
 
+// Token do MP (LIVE = APP_USR-..., TEST = TEST-...)
+const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || '';
+const tokenFlavor =
+  MP_ACCESS_TOKEN.startsWith('APP_USR-') ? 'APP_USR' :
+  MP_ACCESS_TOKEN.startsWith('TEST-')    ? 'TEST'    : 'UNKNOWN';
+console.log(`[BOOT] MP token flavor: ${tokenFlavor} | last6=${MP_ACCESS_TOKEN.slice(-6)}`);
+if (!MP_ACCESS_TOKEN) {
+  console.error('⛔ MP_ACCESS_TOKEN não definido nas variáveis de ambiente');
+  process.exit(1);
+}
+
+// Cliente Mercado Pago (SDK v2)
+const mpClient = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN });
+
+// Helper HTTP p/ APIs REST do MP (v2 ainda precisa de chamadas REST em alguns fluxos)
+const MP_HTTP = axios.create({
+  baseURL:'https://api.mercadopago.com',
+  headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
+});
+async function mpGet(path) {
+  const { data } = await MP_HTTP.get(path);
+  return data;
+}
+
+/* ======================== STORE EM MEMÓRIA ======================== */
+// Para testes E2E; em produção troque por DB.
+const ordersStatus = new Map();
+// Estrutura: ordersStatus.set(externalRef, { status, payment_id, merchant_order_id, last_status_raw, updated_at })
+function setOrdersStatus(externalRef, payload) {
+  const prev = ordersStatus.get(externalRef) || {};
+  const merged = { ...prev, ...payload, updated_at: new Date().toISOString() };
+  ordersStatus.set(externalRef, merged);
+  console.log('[ORDERS][SET]', externalRef, merged);
+}
+// Alias para compatibilidade, caso algum trecho antigo use o nome no singular
+const setOrderStatus = (ref, payload) => setOrdersStatus(ref, payload);
+
+/* ======================== MIDDLEWARES BASE ======================== */
+// CORS — permite localhost (dev) e seus domínios de produção
+const allowedOrigins = [
+  /^http:\/\/localhost:\d+$/, // ex: http://localhost:5173, 51530 etc.
+  'http://localhost',
+  'https://localhost',
+  'https://api.clicaipa.com.br',
+  'https://clicaipa-backend.onrender.com',
+];
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // apps nativos/curl
+    if (allowedOrigins.some(p => p instanceof RegExp ? p.test(origin) : p === origin)) {
+      return cb(null, true);
+    }
+    // Durante testes, liberar tudo. No hardening, troque por: cb(new Error('CORS not allowed'));
+    return cb(null, true);
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning'],
+  maxAge: 86400,
+}));
+app.options('*', cors()); // preflight
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-/* -------------------- Ping / Health -------------------- */
+/* ======================== HEALTH/PING ======================== */
 app.get('/ping', (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 app.get('/', (_req, res) => res.send('OK – Clicaipá backend no ar'));
 app.get('/health', (_req, res) => res.status(200).send('ok'));
@@ -29,7 +90,6 @@ app.get('/health', (_req, res) => res.status(200).send('ok'));
 /* -------------------- SQLite (persistência) -------------------- */
 const db = new Database(path.join(__dirname, 'data.sqlite'));
 db.pragma('journal_mode = WAL');
-
 db.exec(`
   CREATE TABLE IF NOT EXISTS orders (
     external_ref TEXT PRIMARY KEY,
@@ -42,7 +102,6 @@ db.exec(`
     updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
   );
 `);
-
 const upsertPaid = db.prepare(`
   INSERT INTO orders (external_ref, status, amount, merchant_order_id, payment_id, paid_at, updated_at)
   VALUES (@external_ref, 'pago', @amount, @merchant_order_id, @payment_id, @paid_at, datetime('now'))
@@ -55,65 +114,13 @@ const upsertPaid = db.prepare(`
     updated_at=datetime('now');
 `);
 
-/* -------------------- Mercado Pago config -------------------- */
-const token = process.env.MP_ACCESS_TOKEN || '';
-const flavor = token.includes('APP_USR-') ? 'APP_USR' : token.startsWith('TEST-') ? 'TEST' : 'unknown';
-console.log(`[BOOT] MP token flavor: ${flavor} | last6=${token.slice(-6)}`);
-
-const {
-  // NÃO declare PORT aqui para evitar duplicar lá no listen
-  MP_ACCESS_TOKEN,
-  MP_PUBLIC_KEY,
-  PUBLIC_BASE_URL,
-} = process.env;
-
-if (!MP_ACCESS_TOKEN || !MP_PUBLIC_KEY || !PUBLIC_BASE_URL) {
-  console.error('[BOOT] Faltam variáveis no .env: MP_ACCESS_TOKEN, MP_PUBLIC_KEY, PUBLIC_BASE_URL');
-  process.exit(1);
-}
-
-const mpClient = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN });
-
-// http helper (Axios) para endpoints REST do MP
-const MP_HTTP = axios.create({
-  baseURL: 'https://api.mercadopago.com',
-  headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
-});
-async function mpGet(path) {
-  const { data } = await MP_HTTP.get(path);
-  return data;
-}
-
-/* -------------------- Rotas auxiliares -------------------- */
-app.get('/whoami', async (_req, res) => {
-  try {
-    const me = await MP_HTTP.get('/users/me').then(r => r.data);
-    res.json({ id: me.id, nickname: me.nickname, email: me.email, site_id: me.site_id });
-  } catch (e) {
-    res.status(500).json({ error: e?.response?.data || e?.message });
-  }
-});
-
-// Trata JSON inválido sem derrubar webhook
-app.use((err, req, res, next) => {
-  if (err instanceof SyntaxError && 'body' in err) {
-    console.warn('[PARSER] JSON inválido em', req.path);
-    return res.sendStatus(200);
-  }
-  next(err);
-});
-
 /* -------------------- Helpers -------------------- */
 function gerarOrderId() {
   const dt = new Date();
   const pad = (n) => String(n).padStart(2, '0');
   const stamp = [
-    dt.getFullYear(),
-    pad(dt.getMonth() + 1),
-    pad(dt.getDate()),
-    '-',
-    pad(dt.getHours()), 'h',
-    pad(dt.getMinutes()), 'm',
+    dt.getFullYear(), pad(dt.getMonth() + 1), pad(dt.getDate()),
+    '-', pad(dt.getHours()), 'h', pad(dt.getMinutes()), 'm',
   ].join('');
   const rand = Math.random().toString(36).slice(2, 8).toUpperCase();
   return `PED-${stamp}-${rand}`;
@@ -123,23 +130,31 @@ function gerarOrderId() {
 app.post('/create_preference', async (req, res) => {
   try {
     const {
-      title = 'Produto teste',
+      title = 'Item de teste',
       quantity = 1,
-      unit_price = 9.9,
-      orderId,        // opcional
-      payer_email,    // opcional (comprador de teste)
+      unit_price = 1.0, // pra validar fluxo; em prod use valor real
+      orderId,          // opcional
+      payer_email,      // opcional (prefill)
     } = req.body || {};
 
     const resolvedOrderId = String(orderId || gerarOrderId());
 
+    const qtt = Math.max(1, parseInt(quantity, 10) || 1);
+    const price = Number(unit_price);
+    if (!Number.isFinite(price) || price <= 0) {
+      return res.status(400).json({ error: 'unit_price inválido' });
+    }
+
+    const notificationUrl = `${PUBLIC_BASE_URL}/webhook`;
     const pref = new Preference(mpClient);
     const body = {
       items: [{
         title: String(title),
-        quantity: Number(quantity) || 1,
-        unit_price: Number(unit_price) || 9.9,
+        quantity: qtt,
+        unit_price: price,
+        currency_id: 'BRL',
       }],
-      notification_url: `${PUBLIC_BASE_URL}/webhook`,
+      notification_url: notificationUrl,
       back_urls: {
         success: `${PUBLIC_BASE_URL}/retorno?status=success`,
         failure: `${PUBLIC_BASE_URL}/retorno?status=failure`,
@@ -147,19 +162,25 @@ app.post('/create_preference', async (req, res) => {
       },
       auto_return: 'approved',
       external_reference: resolvedOrderId,
+      statement_descriptor: 'CLICAIPA',
+      metadata: { external_reference: resolvedOrderId, source: 'clicaipa-app' },
     };
+    if (payer_email) body.payer = { email: String(payer_email) };
 
-    if (payer_email) body.payer = { email: payer_email };
+console.log('[PREFERENCE][CONF]', {
+  PUBLIC_BASE_URL,
+  notification_url: notificationUrl,
+  back_urls: body.back_urls,
+});
+
 
     const mpRes = await pref.create({ body });
-    console.log('[PREFERENCE][OK]', mpRes.id, 'external_reference=', body.external_reference);
+    console.log('[PREFERENCE][OK]', 'id=', mpRes?.id, 'external_reference=', resolvedOrderId);
 
     return res.status(201).json({
-      init_point: mpRes.init_point,
-      sandbox_init_point: mpRes.sandbox_init_point,
-      preference_id: mpRes.id,
-      public_key: MP_PUBLIC_KEY,
-      external_reference: body.external_reference,
+      preference_id: mpRes?.id,
+      init_point: mpRes?.init_point,
+      external_reference: resolvedOrderId,
     });
   } catch (err) {
     console.error('[PREFERENCE][ERR]', err?.response?.data || err?.message || err);
@@ -167,68 +188,14 @@ app.post('/create_preference', async (req, res) => {
   }
 });
 
-/* -------------------- PIX (criação) -------------------- */
-/* -------------------- PIX (criação) -------------------- */
-app.post('/payments/pix', async (req, res) => {
-  try {
-    const {
-      external_ref,
-      amount,
-      // campos opcionais vindos do app (se não vierem, uso defaults de teste)
-      payer_email,
-      payer_first_name,
-      payer_last_name,
-      payer_doc_type,
-      payer_doc_number,
-    } = req.body || {};
-
-    const body = {
-      transaction_amount: Number(amount || 9.9),
-      description: 'Clicaipá - Geração de Cardápio',
-      payment_method_id: 'pix',
-      external_reference: external_ref || gerarOrderId(),
-      notification_url: `${PUBLIC_BASE_URL}/webhook`,
-      payer: {
-        email: (payer_email || 'comprador+pix@example.com').toString(),
-        first_name: (payer_first_name || 'Pix').toString(),
-        last_name: (payer_last_name || 'Buyer').toString(),
-        identification: {
-          type: (payer_doc_type || 'CPF').toString(),
-          number: (payer_doc_number || '19119119100').toString(), // CPF de teste
-        },
-      },
-    };
-
-    const mpResp = await fetch('https://api.mercadopago.com/v1/payments', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.MP_ACCESS_TOKEN}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(body),
-    });
-
-    const pay = await mpResp.json();
-
-    if (!mpResp.ok) {
-      console.error('[PIX][CREATE][ERR]', JSON.stringify(pay, null, 2));
-      // devolve os detalhes pra conseguirmos ver no app/log
-      return res.status(400).json({ error: 'pix_create_failed', details: pay });
-    }
-
-    const td = pay?.point_of_interaction?.transaction_data || {};
-    return res.json({
-      payment_id: pay.id,
-      status: pay.status, // normalmente 'pending' até pagar
-      qr_base64: td.qr_code_base64,
-      qr_copia_e_cola: td.qr_code,
-      external_reference: pay.external_reference,
-    });
-  } catch (e) {
-    console.error('[PIX][CREATE][ERR]', e);
-    return res.status(500).json({ error: 'internal_error' });
-  }
+console.log('[PREFERENCE][OK]', {
+  id: mpRes?.id,
+  external_reference: resolvedOrderId,
 });
+
+
+/* -------------------- PIX (criação) — OPCIONAL (desativado) -------------------- */
+// app.post('/payments/pix', async (req, res) => { ... });
 
 /* -------------------- Conciliação / Persistência -------------------- */
 const pagamentosProcessados = new Set();
@@ -246,7 +213,13 @@ async function marcarPedidoComoPago(externalRef, meta = {}) {
       payment_id: meta.paymentId ? String(meta.paymentId) : null,
       paid_at: new Date().toISOString(),
     });
-    console.log('[PAGO][DB] Persistido no SQLite:', {
+    // também atualiza o Map usado pelo /orders/:externalRef
+    setOrdersStatus(externalRef, {
+      status: 'pago',
+      payment_id: meta.paymentId || null,
+      merchant_order_id: meta.merchantOrderId || null,
+    });
+    console.log('[PAGO][DB] Persistido no SQLite + Map:', {
       external_ref: externalRef,
       amount: meta.amount,
       merchant_order_id: meta.merchantOrderId,
@@ -269,6 +242,11 @@ async function conciliarPorPayment(paymentId) {
     throw err;
   }
 
+  // salva sempre o último status bruto para debug
+  if (p?.external_reference) {
+    setOrdersStatus(p.external_reference, { last_status_raw: String(p.status || '') });
+  }
+
   console.log('[RETORNO][PAYMENT]', {
     id: p.id,
     status: p.status,
@@ -281,7 +259,6 @@ async function conciliarPorPayment(paymentId) {
     console.log('[IDEMP] Payment já processado:', p.id);
     return;
   }
-
   if (p.status !== 'approved') {
     console.log('[PENDENTE] Payment ainda não aprovado:', p.status);
     return;
@@ -313,19 +290,22 @@ async function conciliarPorPayment(paymentId) {
     console.log('[OK] Conciliação concluída (payment->MO).');
   } else {
     console.log('[PENDENTE] MO ainda não fechada; aguardar webhook merchant_order.', {
-      total,
-      paid,
-      moStatus: mo.status,
+      total, paid, moStatus: mo.status,
     });
   }
 }
 
 async function conciliarPorMerchantOrder(merchantOrderId) {
   const mo = await mpGet(`/merchant_orders/${merchantOrderId}`);
-  const total = mo.total_amount || 0;
-  const paid = mo.paid_amount || 0;
 
-  console.log('[MO][RAW]', { id: mo.id, status: mo.status, total_amount: total, paid_amount: paid, preference_id: mo.preference_id, collector: mo.collector, payments: mo.payments });
+  // status bruto da MO
+  if (mo?.external_reference) {
+    setOrdersStatus(mo.external_reference, { last_status_raw: String(mo.status || '') });
+  }
+
+  const total = mo.total_amount || 0;
+  const paid  = mo.paid_amount || 0;
+  console.log('[MO][RAW]', { id: mo.id, status: mo.status, total_amount: total, paid_amount: paid });
 
   if (paid >= total && total > 0) {
     const paymentId = mo.payments?.[0]?.id || null;
@@ -341,11 +321,7 @@ async function conciliarPorMerchantOrder(merchantOrderId) {
     if (paymentId) pagamentosProcessados.add(paymentId);
     console.log('[OK] Conciliação concluída (merchant_order).');
   } else {
-    console.log('[MO][ABERTO] Aguardando pagamento fechar.', {
-      total,
-      paid,
-      status: mo.status,
-    });
+    console.log('[MO][ABERTO] Aguardando pagamento fechar.', { total, paid, status: mo.status });
   }
 }
 
@@ -356,25 +332,21 @@ app.all('/webhook', async (req, res) => {
     console.log('=== [WEBHOOK] QUERY   ===\n', req.query);
     console.log('=== [WEBHOOK] BODY    ===\n', req.body);
 
+    // responda 200 rápido para evitar retries excessivos
     res.sendStatus(200);
 
     const body = req.body || {};
     const q = req.query || {};
 
-    if (body?.type === 'payment' && body?.data?.id) {
-      await conciliarPorPayment(body.data.id); return;
-    }
-    if (body?.type === 'merchant_order' && body?.data?.id) {
-      await conciliarPorMerchantOrder(body.data.id); return;
-    }
+    // Formato novo (body.type/data.id)
+    if (body?.type === 'payment' && body?.data?.id) { await conciliarPorPayment(body.data.id); return; }
+    if (body?.type === 'merchant_order' && body?.data?.id) { await conciliarPorMerchantOrder(body.data.id); return; }
 
-    if (q?.topic === 'merchant_order' && q?.id) {
-      await conciliarPorMerchantOrder(String(q.id)); return;
-    }
-    if (q?.type === 'payment' && q['data.id']) {
-      await conciliarPorPayment(String(q['data.id'])); return;
-    }
+    // Formato antigo (?topic=&id=)
+    if (q?.topic === 'merchant_order' && q?.id) { await conciliarPorMerchantOrder(String(q.id)); return; }
+    if (q?.type === 'payment' && q['data.id']) { await conciliarPorPayment(String(q['data.id'])); return; }
 
+    // Formato legado (resource=/merchant_orders/:id ou /payments/:id)
     if (body?.resource && typeof body.resource === 'string') {
       if (body.resource.includes('/merchant_orders/')) {
         const id = body.resource.split('/merchant_orders/')[1]?.split(/[^\d]/)[0];
@@ -390,6 +362,62 @@ app.all('/webhook', async (req, res) => {
   } catch (err) {
     console.error('[WEBHOOK][ERR]', err);
   }
+});
+
+/* -------------------- Consulta de status (Map + SQLite fallback) -------------------- */
+app.get('/orders/:externalRef', async (req, res) => {
+  try {
+    const externalRef = String(req.params.externalRef || '').trim();
+    if (!externalRef) {
+      return res.status(400).json({ error: 'externalRef obrigatório' });
+    }
+
+    // 1) Tenta o Map (webhook em memória)
+    const stored = ordersStatus.get(externalRef);
+    if (stored) {
+      return res.status(200).json({
+        external_reference: externalRef,
+        status: stored.status || 'aguardando',
+        payment_id: stored.payment_id || null,
+        merchant_order_id: stored.merchant_order_id || null,
+        updated_at: stored.updated_at || null,
+        last_status_raw: stored.last_status_raw || null,
+      });
+    }
+
+    // 2) Fallback: consulta o SQLite (útil após restart)
+    const row = db.prepare('SELECT status, payment_id, merchant_order_id, updated_at FROM orders WHERE external_ref = ?')
+                  .get(externalRef);
+    if (row) {
+      return res.status(200).json({
+        external_reference: externalRef,
+        status: row.status,
+        payment_id: row.payment_id,
+        merchant_order_id: row.merchant_order_id,
+        updated_at: row.updated_at,
+        last_status_raw: row.status,
+      });
+    }
+
+    // 3) Nada ainda → aguardando
+    return res.status(200).json({
+      external_reference: externalRef,
+      status: 'aguardando',
+      updated_at: null,
+    });
+  } catch (err) {
+    console.error('[ORDER][GET][ERR]', err?.message || err);
+    return res.status(500).json({ error: 'Erro ao consultar pedido' });
+  }
+});
+
+// Debug (REMOVER no go-live)
+app.get('/orders/_debug', (_req, res) => {
+  const all = [];
+  for (const [k, v] of ordersStatus.entries()) {
+    all.push({ external_reference: k, ...v });
+  }
+  return res.status(200).json(all);
 });
 
 /* -------------------- Retorno (backup com poll) -------------------- */
@@ -415,7 +443,6 @@ app.get('/retorno', async (req, res) => {
     console.log('[RETORNO]', req.query);
 
     const toArr = (v) => Array.isArray(v) ? v : (v == null ? [] : [v]);
-
     const statuses = [
       ...toArr(req.query?.status),
       ...toArr(req.query?.collection_status),
@@ -428,15 +455,9 @@ app.get('/retorno', async (req, res) => {
       try {
         const r = await waitForMerchantOrderPaid(moId, { tries: 20, intervalMs: 3000 });
         console.log('[RETORNO][MERCHANT_ORDER][OK]', {
-          id: r.id,
-          status: r.status,
-          total_amount: r.total_amount,
-          paid_amount: r.paid_amount,
+          id: r.id, status: r.status, total_amount: r.total_amount, paid_amount: r.paid_amount,
           payments: (r.payments || []).map(p => ({
-            id: p.id,
-            status: p.status,
-            status_detail: p.status_detail,
-            total_paid_amount: p.total_paid_amount,
+            id: p.id, status: p.status, status_detail: p.status_detail, total_paid_amount: p.total_paid_amount,
           })),
         });
       } catch (e) {
@@ -464,26 +485,13 @@ app.all('/ipn', async (req, res) => {
   }
 });
 
-/* -------------------- Consulta pedidos pagos -------------------- */
-app.get('/orders/:external_ref', (req, res) => {
-  try {
-    const row = db.prepare('SELECT * FROM orders WHERE external_ref = ?').get(req.params.external_ref);
-    if (!row) {
-      return res.status(404).json({ error: 'Pedido não encontrado' });
-    }
-    res.json(row);
-  } catch (e) {
-    console.error('[ORDERS][ERR]', e?.message || e);
-    res.status(500).json({ error: 'Erro ao consultar pedido' });
-  }
-});
-
-/* ====================== FIM DAS SUAS ROTAS ====================== */
+/* ====================== FIM DAS ROTAS ====================== */
 
 // 404 padrão (opcional)
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
-const PORT = process.env.PORT || 3000;     // único local onde PORT é declarado
+const PORT = process.env.PORT || 3000; // único local onde PORT é declarado
 app.listen(PORT, () => {
   console.log(`API rodando em http://localhost:${PORT}`);
 });
+
