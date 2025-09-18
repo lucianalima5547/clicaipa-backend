@@ -15,8 +15,12 @@ const app = express();
 
 /* ======================== ENV & CONFIG ======================== */
 // Host público usado em notification_url e back_urls
-const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || 'https://clicaipa-backend.onrender.com')
+const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || 'https://api.clicaipa.com.br')
   .replace(/\/+$/, ''); // remove barra final
+
+// URL da tela de resultado do FRONT (usada no redirect do /retorno, Web mesma aba)
+const FRONTEND_RESULT_URL = process.env.FRONTEND_RESULT_URL || 'https://app.clicaipa.com.br/#/resultado';
+console.log('[BOOT] FRONTEND_RESULT_URL=', FRONTEND_RESULT_URL);
 
 // Token do MP (LIVE = APP_USR-..., TEST = TEST-...)
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || '';
@@ -67,6 +71,8 @@ const allowedOrigins = [
   'https://localhost',
   'https://api.clicaipa.com.br',
   'https://clicaipa-backend.onrender.com',
+  'https://clicaipa.com.br',
+  'https://app.clicaipa.com.br',
 ];
 app.use(cors({
   origin: (origin, cb) => {
@@ -130,6 +136,25 @@ function gerarOrderId() {
   return `PED-${stamp}-${rand}`;
 }
 
+// Monta URL de resultado respeitando hash-routes (ex.: #/resultado?externalRef=...)
+function buildFrontResultUrl(frontBase, externalRef) {
+  if (!frontBase) return null;
+  try {
+    if (frontBase.includes('#')) {
+      const [base, hash] = frontBase.split('#');        // base = https://app..., hash = /resultado?foo=bar
+      const [hashPath, hashQuery] = (hash || '').split('?');
+      const qp = new URLSearchParams(hashQuery || '');
+      qp.set('externalRef', externalRef);
+      return `${base}#${hashPath}?${qp.toString()}`;
+    }
+    const u = new URL(frontBase);
+    u.searchParams.set('externalRef', externalRef);
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
 /* -------------------- Create Preference (Checkout Pro) -------------------- */
 app.post('/create_preference', async (req, res) => {
   try {
@@ -160,10 +185,11 @@ app.post('/create_preference', async (req, res) => {
       }],
       notification_url: notificationUrl,
       back_urls: {
-        success: `${PUBLIC_BASE_URL}/retorno?status=success`,
-        failure: `${PUBLIC_BASE_URL}/retorno?status=failure`,
-        pending: `${PUBLIC_BASE_URL}/retorno?status=pending`,
+        success: `${PUBLIC_BASE_URL}/retorno?status=success&external_ref=${encodeURIComponent(resolvedOrderId)}&external_reference=${encodeURIComponent(resolvedOrderId)}`,
+        failure: `${PUBLIC_BASE_URL}/retorno?status=failure&external_ref=${encodeURIComponent(resolvedOrderId)}&external_reference=${encodeURIComponent(resolvedOrderId)}`,
+        pending: `${PUBLIC_BASE_URL}/retorno?status=pending&external_ref=${encodeURIComponent(resolvedOrderId)}&external_reference=${encodeURIComponent(resolvedOrderId)}`,
       },
+
       auto_return: 'approved',
       external_reference: resolvedOrderId,
       statement_descriptor: 'CLICAIPA',
@@ -179,6 +205,11 @@ app.post('/create_preference', async (req, res) => {
     });
 
     const mpRes = await pref.create({ body });
+
+    console.log('[PREFERENCE][OK]', {
+      id: mpRes?.id,
+      external_reference: resolvedOrderId,
+    });
 
     return res.status(201).json({
       preference_id: mpRes?.id,
@@ -414,7 +445,7 @@ app.get('/orders/_debug', (_req, res) => {
   return res.status(200).json(all);
 });
 
-/* -------------------- Retorno (backup com poll) -------------------- */
+/* -------------------- Retorno (backup com poll + redirect p/ FRONT) -------------------- */
 async function waitForMerchantOrderPaid(merchantOrderId, { tries = 20, intervalMs = 3000 } = {}) {
   const moClient = new MerchantOrder(mpClient);
   for (let i = 1; i <= tries; i++) {
@@ -432,41 +463,31 @@ async function waitForMerchantOrderPaid(merchantOrderId, { tries = 20, intervalM
   throw new Error('Merchant Order ainda não confirmada como paga dentro do tempo de espera.');
 }
 
-app.get('/retorno', async (req, res) => {
-  try {
-    console.log('[RETORNO]', req.query);
+app.get('/retorno', (req, res) => {
+  console.log('[RETORNO v5]', req.query, 'FRONTEND_RESULT_URL=', FRONTEND_RESULT_URL);
 
-    const toArr = (v) => Array.isArray(v) ? v : (v == null ? [] : [v]);
-    const statuses = [
-      ...toArr(req.query?.status),
-      ...toArr(req.query?.collection_status),
-    ].map(s => String(s).toLowerCase());
+  const externalRef = '' + (req.query.external_reference || req.query.external_ref || '');
+  if (!externalRef) return res.status(400).send('missing externalRef');
 
-    const isApprovedLike = statuses.some(s => s === 'success' || s === 'approved');
-    const moId = req.query?.merchant_order_id || req.query?.merchant_order;
-
-    if (isApprovedLike && moId) {
-      try {
-        const r = await waitForMerchantOrderPaid(moId, { tries: 20, intervalMs: 3000 });
-        console.log('[RETORNO][MERCHANT_ORDER][OK]', {
-          id: r.id, status: r.status, total_amount: r.total_amount, paid_amount: r.paid_amount,
-          payments: (r.payments || []).map(p => ({
-            id: p.id, status: p.status, status_detail: p.status_detail, total_paid_amount: p.total_paid_amount,
-          })),
-        });
-      } catch (e) {
-        console.error('[RETORNO][MO][ERR]', e?.message || e);
-      }
-    } else {
-      console.log('[RETORNO] status não aprovado ou sem merchant_order_id:', { statuses, moId });
-    }
-
-    return res.send('ok');
-  } catch (err) {
-    console.error('[RETORNO][ERR]', err);
-    return res.send('ok');
+  let target;
+  if (FRONTEND_RESULT_URL.includes('#')) {
+    const [base, hash = ''] = FRONTEND_RESULT_URL.split('#');
+    const [path, q = ''] = hash.split('?');
+    const sp = new URLSearchParams(q);
+    sp.set('externalRef', externalRef);
+    target = `${base}#${path}?${sp.toString()}`;
+  } else {
+    const u = new URL(FRONTEND_RESULT_URL);
+    u.searchParams.set('externalRef', externalRef);
+    target = u.toString();
   }
+
+  console.log('[RETORNO v5][REDIRECT] →', target);
+  return res.redirect(302, target);
 });
+
+
+
 
 /* -------------------- IPN legado -------------------- */
 app.all('/ipn', async (req, res) => {
