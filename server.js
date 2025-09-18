@@ -1,8 +1,7 @@
-
+// Carrega .env só em dev (não sobrescreve env do Render)
 if (process.env.NODE_ENV !== 'production') {
-  require('dotenv').config(); // sem override
+  require('dotenv').config();
 }
-
 
 const path = require('path');
 const express = require('express');
@@ -24,7 +23,11 @@ const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || '';
 const tokenFlavor =
   MP_ACCESS_TOKEN.startsWith('APP_USR-') ? 'APP_USR' :
   MP_ACCESS_TOKEN.startsWith('TEST-')    ? 'TEST'    : 'UNKNOWN';
+
+console.log('[BOOT] NODE_ENV=', process.env.NODE_ENV);
+console.log('[BOOT] PUBLIC_BASE_URL=', PUBLIC_BASE_URL);
 console.log(`[BOOT] MP token flavor: ${tokenFlavor} | last6=${MP_ACCESS_TOKEN.slice(-6)}`);
+
 if (!MP_ACCESS_TOKEN) {
   console.error('⛔ MP_ACCESS_TOKEN não definido nas variáveis de ambiente');
   process.exit(1);
@@ -33,13 +36,13 @@ if (!MP_ACCESS_TOKEN) {
 // Cliente Mercado Pago (SDK v2)
 const mpClient = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN });
 
-// Helper HTTP p/ APIs REST do MP (v2 ainda precisa de chamadas REST em alguns fluxos)
+// Helper HTTP p/ APIs REST do MP
 const MP_HTTP = axios.create({
-  baseURL:'https://api.mercadopago.com',
+  baseURL: 'https://api.mercadopago.com',
   headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
 });
-async function mpGet(path) {
-  const { data } = await MP_HTTP.get(path);
+async function mpGet(pathname) {
+  const { data } = await MP_HTTP.get(pathname);
   return data;
 }
 
@@ -53,13 +56,13 @@ function setOrdersStatus(externalRef, payload) {
   ordersStatus.set(externalRef, merged);
   console.log('[ORDERS][SET]', externalRef, merged);
 }
-// Alias para compatibilidade, caso algum trecho antigo use o nome no singular
+// Alias para compat com trechos antigos
 const setOrderStatus = (ref, payload) => setOrdersStatus(ref, payload);
 
 /* ======================== MIDDLEWARES BASE ======================== */
 // CORS — permite localhost (dev) e seus domínios de produção
 const allowedOrigins = [
-  /^http:\/\/localhost:\d+$/, // ex: http://localhost:5173, 51530 etc.
+  /^http:\/\/localhost:\d+$/, // ex: http://localhost:5173 etc.
   'http://localhost',
   'https://localhost',
   'https://api.clicaipa.com.br',
@@ -78,7 +81,8 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning'],
   maxAge: 86400,
 }));
-app.options('*', cors()); // preflight
+app.options(/.*/, cors()); // Express 5: catch-all preflight
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -167,15 +171,14 @@ app.post('/create_preference', async (req, res) => {
     };
     if (payer_email) body.payer = { email: String(payer_email) };
 
-console.log('[PREFERENCE][CONF]', {
-  PUBLIC_BASE_URL,
-  notification_url: notificationUrl,
-  back_urls: body.back_urls,
-});
-
+    // Loga o que vai pra preference (verifica se não ficou ngrok)
+    console.log('[PREFERENCE][CONF]', {
+      PUBLIC_BASE_URL,
+      notification_url: notificationUrl,
+      back_urls: body.back_urls,
+    });
 
     const mpRes = await pref.create({ body });
-    console.log('[PREFERENCE][OK]', 'id=', mpRes?.id, 'external_reference=', resolvedOrderId);
 
     return res.status(201).json({
       preference_id: mpRes?.id,
@@ -187,15 +190,6 @@ console.log('[PREFERENCE][CONF]', {
     return res.status(500).json({ error: 'Erro ao criar preferência' });
   }
 });
-
-console.log('[PREFERENCE][OK]', {
-  id: mpRes?.id,
-  external_reference: resolvedOrderId,
-});
-
-
-/* -------------------- PIX (criação) — OPCIONAL (desativado) -------------------- */
-// app.post('/payments/pix', async (req, res) => { ... });
 
 /* -------------------- Conciliação / Persistência -------------------- */
 const pagamentosProcessados = new Set();
@@ -242,7 +236,7 @@ async function conciliarPorPayment(paymentId) {
     throw err;
   }
 
-  // salva sempre o último status bruto para debug
+  // status bruto p/ debug
   if (p?.external_reference) {
     setOrdersStatus(p.external_reference, { last_status_raw: String(p.status || '') });
   }
@@ -277,7 +271,7 @@ async function conciliarPorPayment(paymentId) {
   }
 
   const total = mo.total_amount || 0;
-  const paid = mo.paid_amount || 0;
+  const paid  = mo.paid_amount || 0;
   console.log('[MO][CHECK]', { id: mo.id, status: mo.status, total, paid });
 
   if (paid >= total && total > 0) {
@@ -298,7 +292,7 @@ async function conciliarPorPayment(paymentId) {
 async function conciliarPorMerchantOrder(merchantOrderId) {
   const mo = await mpGet(`/merchant_orders/${merchantOrderId}`);
 
-  // status bruto da MO
+  // status bruto p/ debug
   if (mo?.external_reference) {
     setOrdersStatus(mo.external_reference, { last_status_raw: String(mo.status || '') });
   }
@@ -332,7 +326,7 @@ app.all('/webhook', async (req, res) => {
     console.log('=== [WEBHOOK] QUERY   ===\n', req.query);
     console.log('=== [WEBHOOK] BODY    ===\n', req.body);
 
-    // responda 200 rápido para evitar retries excessivos
+    // responde 200 rápido para evitar retries excessivos
     res.sendStatus(200);
 
     const body = req.body || {};
@@ -490,8 +484,7 @@ app.all('/ipn', async (req, res) => {
 // 404 padrão (opcional)
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
-const PORT = process.env.PORT || 3000; // único local onde PORT é declarado
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`API rodando em http://localhost:${PORT}`);
 });
-
