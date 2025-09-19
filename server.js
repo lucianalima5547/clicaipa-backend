@@ -1,28 +1,51 @@
-// Carrega .env só em dev (não sobrescreve env do Render)
-if (process.env.NODE_ENV !== 'production') {
-  require('dotenv').config();
-}
-
 const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const Database = require('better-sqlite3');
 const mp = require('mercadopago');
-const { MercadoPagoConfig, Preference, MerchantOrder } = mp;
+const { MercadoPagoConfig, Preference } = mp;
 
+// 🔹 Firebase Admin (suporta env e arquivo local)
+const admin = require("firebase-admin");
+let serviceAccount;
+
+if (process.env.FIREBASE_CONFIG) {
+  try {
+    serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
+    console.log("[BOOT] Firebase config carregado da variável de ambiente.");
+  } catch (e) {
+    console.error("⛔ FIREBASE_CONFIG inválido:", e.message);
+    process.exit(1);
+  }
+} else {
+  try {
+    serviceAccount = require("./keys/serviceAccountKey.json");
+    console.log("[BOOT] Firebase config carregado do arquivo ./keys/serviceAccountKey.json");
+  } catch (e) {
+    console.error("⛔ Não encontrou serviceAccountKey.json e FIREBASE_CONFIG não definido.");
+    process.exit(1);
+  }
+}
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
+
+const fdb = admin.firestore();
 const app = express();
 
 /* ======================== ENV & CONFIG ======================== */
-// Host público usado em notification_url e back_urls
-const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || 'https://api.clicaipa.com.br')
-  .replace(/\/+$/, ''); // remove barra final
+if (process.env.NODE_ENV !== 'production') {
+  require('dotenv').config();
+}
 
-// URL da tela de resultado do FRONT (usada no redirect do /retorno, Web mesma aba)
+const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || 'https://api.clicaipa.com.br')
+  .replace(/\/+$/, '');
+
 const FRONTEND_RESULT_URL = process.env.FRONTEND_RESULT_URL || 'https://app.clicaipa.com.br/#/resultado';
 console.log('[BOOT] FRONTEND_RESULT_URL=', FRONTEND_RESULT_URL);
 
-// Token do MP (LIVE = APP_USR-..., TEST = TEST-...)
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || '';
 const tokenFlavor =
   MP_ACCESS_TOKEN.startsWith('APP_USR-') ? 'APP_USR' :
@@ -37,10 +60,8 @@ if (!MP_ACCESS_TOKEN) {
   process.exit(1);
 }
 
-// Cliente Mercado Pago (SDK v2)
+// Cliente Mercado Pago
 const mpClient = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN });
-
-// Helper HTTP p/ APIs REST do MP
 const MP_HTTP = axios.create({
   baseURL: 'https://api.mercadopago.com',
   headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
@@ -51,22 +72,28 @@ async function mpGet(pathname) {
 }
 
 /* ======================== STORE EM MEMÓRIA ======================== */
-// Para testes E2E; em produção troque por DB.
 const ordersStatus = new Map();
-// Estrutura: ordersStatus.set(externalRef, { status, payment_id, merchant_order_id, last_status_raw, updated_at })
 function setOrdersStatus(externalRef, payload) {
   const prev = ordersStatus.get(externalRef) || {};
-  const merged = { ...prev, ...payload, updated_at: new Date().toISOString() };
+
+  const merged = {
+    ...prev,
+    ...payload,
+    updated_at: new Date().toISOString(),
+    selections: {
+      ...(prev.selections || {}),
+      ...(payload.selections || {}),
+    },
+  };
+
   ordersStatus.set(externalRef, merged);
   console.log('[ORDERS][SET]', externalRef, merged);
 }
-// Alias para compat com trechos antigos
 const setOrderStatus = (ref, payload) => setOrdersStatus(ref, payload);
 
 /* ======================== MIDDLEWARES BASE ======================== */
-// CORS — permite localhost (dev) e seus domínios de produção
 const allowedOrigins = [
-  /^http:\/\/localhost:\d+$/, // ex: http://localhost:5173 etc.
+  /^http:\/\/localhost:\d+$/,
   'http://localhost',
   'https://localhost',
   'https://api.clicaipa.com.br',
@@ -76,18 +103,17 @@ const allowedOrigins = [
 ];
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // apps nativos/curl
+    if (!origin) return cb(null, true);
     if (allowedOrigins.some(p => p instanceof RegExp ? p.test(origin) : p === origin)) {
       return cb(null, true);
     }
-    // Durante testes, liberar tudo. No hardening, troque por: cb(new Error('CORS not allowed'));
-    return cb(null, true);
+    return cb(null, true); // liberar tudo por enquanto
   },
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning'],
   maxAge: 86400,
 }));
-app.options(/.*/, cors()); // Express 5: catch-all preflight
+app.options(/.*/, cors());
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
@@ -108,19 +134,32 @@ db.exec(`
     merchant_order_id TEXT,
     payment_id   TEXT,
     paid_at      TEXT,
+    selections   TEXT,
     created_at   TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
   );
 `);
+
+const upsertBase = db.prepare(`
+  INSERT INTO orders (external_ref, status, amount, selections, created_at, updated_at)
+  VALUES (@external_ref, @status, @amount, @selections, datetime('now'), datetime('now'))
+  ON CONFLICT(external_ref) DO UPDATE SET
+    status=excluded.status,
+    amount=excluded.amount,
+    selections=excluded.selections,
+    updated_at=datetime('now');
+`);
+
 const upsertPaid = db.prepare(`
-  INSERT INTO orders (external_ref, status, amount, merchant_order_id, payment_id, paid_at, updated_at)
-  VALUES (@external_ref, 'pago', @amount, @merchant_order_id, @payment_id, @paid_at, datetime('now'))
+  INSERT INTO orders (external_ref, status, amount, merchant_order_id, payment_id, paid_at, selections, updated_at)
+  VALUES (@external_ref, 'pago', @amount, @merchant_order_id, @payment_id, @paid_at, @selections, datetime('now'))
   ON CONFLICT(external_ref) DO UPDATE SET
     status='pago',
     amount=excluded.amount,
     merchant_order_id=excluded.merchant_order_id,
     payment_id=excluded.payment_id,
     paid_at=excluded.paid_at,
+    selections=excluded.selections,
     updated_at=datetime('now');
 `);
 
@@ -136,12 +175,11 @@ function gerarOrderId() {
   return `PED-${stamp}-${rand}`;
 }
 
-// Monta URL de resultado respeitando hash-routes (ex.: #/resultado?externalRef=...)
 function buildFrontResultUrl(frontBase, externalRef) {
   if (!frontBase) return null;
   try {
     if (frontBase.includes('#')) {
-      const [base, hash] = frontBase.split('#');        // base = https://app..., hash = /resultado?foo=bar
+      const [base, hash] = frontBase.split('#');
       const [hashPath, hashQuery] = (hash || '').split('?');
       const qp = new URLSearchParams(hashQuery || '');
       qp.set('externalRef', externalRef);
@@ -161,20 +199,24 @@ app.post('/create_preference', async (req, res) => {
     const {
       title = 'Item de teste',
       quantity = 1,
-      unit_price = 1.0, // pra validar fluxo; em prod use valor real
-      orderId,          // opcional
-      payer_email,      // opcional (prefill)
+      unit_price = 1.0,
+      orderId,
+      proteinasSelecionadas = [],
+      carboidratosSelecionados = [],
+      legumesSelecionados = [],
+      outrosSelecionados = [],
+      frescosSelecionados = [],
+      modo = 'congelado',
+      pessoas = null,
     } = req.body || {};
 
     const resolvedOrderId = String(orderId || gerarOrderId());
-
     const qtt = Math.max(1, parseInt(quantity, 10) || 1);
     const price = Number(unit_price);
     if (!Number.isFinite(price) || price <= 0) {
       return res.status(400).json({ error: 'unit_price inválido' });
     }
 
-    const notificationUrl = `${PUBLIC_BASE_URL}/webhook`;
     const pref = new Preference(mpClient);
     const body = {
       items: [{
@@ -183,32 +225,51 @@ app.post('/create_preference', async (req, res) => {
         unit_price: price,
         currency_id: 'BRL',
       }],
-      notification_url: notificationUrl,
+      notification_url: `${PUBLIC_BASE_URL}/webhook`,
       back_urls: {
-        success: `${PUBLIC_BASE_URL}/retorno?status=success&external_ref=${encodeURIComponent(resolvedOrderId)}&external_reference=${encodeURIComponent(resolvedOrderId)}`,
-        failure: `${PUBLIC_BASE_URL}/retorno?status=failure&external_ref=${encodeURIComponent(resolvedOrderId)}&external_reference=${encodeURIComponent(resolvedOrderId)}`,
-        pending: `${PUBLIC_BASE_URL}/retorno?status=pending&external_ref=${encodeURIComponent(resolvedOrderId)}&external_reference=${encodeURIComponent(resolvedOrderId)}`,
+        success: `${FRONTEND_RESULT_URL}?status=success&externalRef=${encodeURIComponent(resolvedOrderId)}`,
+        failure: `${FRONTEND_RESULT_URL}?status=failure&externalRef=${encodeURIComponent(resolvedOrderId)}`,
+        pending: `${FRONTEND_RESULT_URL}?status=pending&externalRef=${encodeURIComponent(resolvedOrderId)}`,
       },
-
       auto_return: 'approved',
       external_reference: resolvedOrderId,
       statement_descriptor: 'CLICAIPA',
-      metadata: { external_reference: resolvedOrderId, source: 'clicaipa-app' },
+      metadata: {
+        external_reference: resolvedOrderId,
+        source: 'clicaipa-app',
+      },
     };
-    if (payer_email) body.payer = { email: String(payer_email) };
 
-    // Loga o que vai pra preference (verifica se não ficou ngrok)
-    console.log('[PREFERENCE][CONF]', {
-      PUBLIC_BASE_URL,
-      notification_url: notificationUrl,
-      back_urls: body.back_urls,
-    });
+    console.log('[PREFERENCE][CONF]', { PUBLIC_BASE_URL, back_urls: body.back_urls });
 
     const mpRes = await pref.create({ body });
 
-    console.log('[PREFERENCE][OK]', {
-      id: mpRes?.id,
-      external_reference: resolvedOrderId,
+    setOrdersStatus(resolvedOrderId, {
+      status: 'aguardando',
+      selections: {
+        proteinasSelecionadas,
+        carboidratosSelecionados,
+        legumesSelecionados,
+        outrosSelecionados,
+        frescosSelecionados,
+        modo,
+        pessoas,
+      },
+    });
+
+    upsertBase.run({
+      external_ref: resolvedOrderId,
+      status: 'aguardando',
+      amount: price,
+      selections: JSON.stringify({
+        proteinasSelecionadas,
+        carboidratosSelecionados,
+        legumesSelecionados,
+        outrosSelecionados,
+        frescosSelecionados,
+        modo,
+        pessoas,
+      }),
     });
 
     return res.status(201).json({
@@ -222,287 +283,187 @@ app.post('/create_preference', async (req, res) => {
   }
 });
 
-/* -------------------- Conciliação / Persistência -------------------- */
-const pagamentosProcessados = new Set();
-
-async function marcarPedidoComoPago(externalRef, meta = {}) {
-  if (!externalRef) {
-    console.warn('[PAGO][DB] external_reference ausente');
-    return;
-  }
-  try {
-    upsertPaid.run({
-      external_ref: externalRef,
-      amount: Number(meta.amount) || null,
-      merchant_order_id: meta.merchantOrderId ? String(meta.merchantOrderId) : null,
-      payment_id: meta.paymentId ? String(meta.paymentId) : null,
-      paid_at: new Date().toISOString(),
-    });
-    // também atualiza o Map usado pelo /orders/:externalRef
-    setOrdersStatus(externalRef, {
-      status: 'pago',
-      payment_id: meta.paymentId || null,
-      merchant_order_id: meta.merchantOrderId || null,
-    });
-    console.log('[PAGO][DB] Persistido no SQLite + Map:', {
-      external_ref: externalRef,
-      amount: meta.amount,
-      merchant_order_id: meta.merchantOrderId,
-      payment_id: meta.paymentId,
-    });
-  } catch (e) {
-    console.error('[PAGO][DB][ERR]', e?.message || e);
-  }
-}
-
-async function conciliarPorPayment(paymentId) {
-  let p;
-  try {
-    p = await mpGet(`/v1/payments/${paymentId}`);
-  } catch (err) {
-    if (err?.response?.status === 404) {
-      console.warn('[PAYMENT] 404 Not Found — aguardando conciliação via merchant_order.', { paymentId });
-      return;
-    }
-    throw err;
-  }
-
-  // status bruto p/ debug
-  if (p?.external_reference) {
-    setOrdersStatus(p.external_reference, { last_status_raw: String(p.status || '') });
-  }
-
-  console.log('[RETORNO][PAYMENT]', {
-    id: p.id,
-    status: p.status,
-    transaction_amount: p.transaction_amount,
-    external_reference: p.external_reference || null,
-    orderId: p.order?.id || null,
-  });
-
-  if (pagamentosProcessados.has(p.id)) {
-    console.log('[IDEMP] Payment já processado:', p.id);
-    return;
-  }
-  if (p.status !== 'approved') {
-    console.log('[PENDENTE] Payment ainda não aprovado:', p.status);
-    return;
-  }
-
-  let mo;
-  if (p.order?.id) {
-    mo = await mpGet(`/merchant_orders/${p.order.id}`);
-  } else {
-    const list = await mpGet(`/merchant_orders?payment_id=${p.id}`);
-    mo = list?.elements?.[0];
-  }
-  if (!mo) {
-    console.warn('[MO] Não encontrada para payment:', p.id);
-    return;
-  }
-
-  const total = mo.total_amount || 0;
-  const paid  = mo.paid_amount || 0;
-  console.log('[MO][CHECK]', { id: mo.id, status: mo.status, total, paid });
-
-  if (paid >= total && total > 0) {
-    await marcarPedidoComoPago(mo.external_reference || p.external_reference, {
-      paymentId: p.id,
-      merchantOrderId: mo.id,
-      amount: paid,
-    });
-    pagamentosProcessados.add(p.id);
-    console.log('[OK] Conciliação concluída (payment->MO).');
-  } else {
-    console.log('[PENDENTE] MO ainda não fechada; aguardar webhook merchant_order.', {
-      total, paid, moStatus: mo.status,
-    });
-  }
-}
-
-async function conciliarPorMerchantOrder(merchantOrderId) {
-  const mo = await mpGet(`/merchant_orders/${merchantOrderId}`);
-
-  // status bruto p/ debug
-  if (mo?.external_reference) {
-    setOrdersStatus(mo.external_reference, { last_status_raw: String(mo.status || '') });
-  }
-
-  const total = mo.total_amount || 0;
-  const paid  = mo.paid_amount || 0;
-  console.log('[MO][RAW]', { id: mo.id, status: mo.status, total_amount: total, paid_amount: paid });
-
-  if (paid >= total && total > 0) {
-    const paymentId = mo.payments?.[0]?.id || null;
-    if (paymentId && pagamentosProcessados.has(paymentId)) {
-      console.log('[IDEMP] Já conciliado via payment:', paymentId);
-      return;
-    }
-    await marcarPedidoComoPago(mo.external_reference, {
-      paymentId,
-      merchantOrderId: mo.id,
-      amount: paid,
-    });
-    if (paymentId) pagamentosProcessados.add(paymentId);
-    console.log('[OK] Conciliação concluída (merchant_order).');
-  } else {
-    console.log('[MO][ABERTO] Aguardando pagamento fechar.', { total, paid, status: mo.status });
-  }
-}
-
 /* -------------------- Webhook -------------------- */
-app.all('/webhook', async (req, res) => {
+app.post('/webhook', async (req, res) => {
   try {
-    console.log('=== [WEBHOOK] HEADERS ===\n', req.headers);
-    console.log('=== [WEBHOOK] QUERY   ===\n', req.query);
-    console.log('=== [WEBHOOK] BODY    ===\n', req.body);
-
-    // responde 200 rápido para evitar retries excessivos
-    res.sendStatus(200);
-
     const body = req.body || {};
-    const q = req.query || {};
+    console.log('[WEBHOOK][BODY]', JSON.stringify(body));
 
-    // Formato novo (body.type/data.id)
-    if (body?.type === 'payment' && body?.data?.id) { await conciliarPorPayment(body.data.id); return; }
-    if (body?.type === 'merchant_order' && body?.data?.id) { await conciliarPorMerchantOrder(body.data.id); return; }
-
-    // Formato antigo (?topic=&id=)
-    if (q?.topic === 'merchant_order' && q?.id) { await conciliarPorMerchantOrder(String(q.id)); return; }
-    if (q?.type === 'payment' && q['data.id']) { await conciliarPorPayment(String(q['data.id'])); return; }
-
-    // Formato legado (resource=/merchant_orders/:id ou /payments/:id)
-    if (body?.resource && typeof body.resource === 'string') {
-      if (body.resource.includes('/merchant_orders/')) {
-        const id = body.resource.split('/merchant_orders/')[1]?.split(/[^\d]/)[0];
-        if (id) { await conciliarPorMerchantOrder(id); return; }
-      }
-      if (body.resource.includes('/payments/')) {
-        const id = body.resource.split('/payments/')[1]?.split(/[^\d]/)[0];
-        if (id) { await conciliarPorPayment(id); return; }
-      }
+    const paymentId = body?.data?.id || body?.id;
+    if (!paymentId) {
+      return res.status(400).json({ error: 'paymentId ausente' });
     }
 
-    console.log('[WEBHOOK] Tipo/forma não tratada:', { query: q, body });
-  } catch (err) {
-    console.error('[WEBHOOK][ERR]', err);
-  }
-});
+    const pagamento = await mpGet(`/v1/payments/${paymentId}`);
+    console.log('[WEBHOOK][PAYMENT]', pagamento?.id, pagamento?.status, pagamento?.external_reference);
 
-/* -------------------- Consulta de status (Map + SQLite fallback) -------------------- */
-app.get('/orders/:externalRef', async (req, res) => {
-  try {
-    const externalRef = String(req.params.externalRef || '').trim();
+    const externalRef = pagamento?.external_reference;
     if (!externalRef) {
-      return res.status(400).json({ error: 'externalRef obrigatório' });
+      return res.status(200).send('ok sem externalRef');
     }
 
-    // 1) Tenta o Map (webhook em memória)
-    const stored = ordersStatus.get(externalRef);
-    if (stored) {
-      return res.status(200).json({
-        external_reference: externalRef,
-        status: stored.status || 'aguardando',
-        payment_id: stored.payment_id || null,
-        merchant_order_id: stored.merchant_order_id || null,
-        updated_at: stored.updated_at || null,
-        last_status_raw: stored.last_status_raw || null,
+    const prev = ordersStatus.get(externalRef) || {};
+    const merged = {
+      ...prev,
+      status: pagamento?.status || 'desconhecido',
+      payment_id: String(pagamento?.id || ''),
+      merchant_order_id: pagamento?.order?.id ? String(pagamento.order.id) : null,
+      amount: pagamento?.transaction_amount || prev.amount,
+      paid_at: pagamento?.status === 'approved' ? new Date().toISOString() : prev.paid_at,
+      last_status_raw: pagamento?.status,
+      updated_at: new Date().toISOString(),
+    };
+    ordersStatus.set(externalRef, merged);
+    console.log('[WEBHOOK][SET]', externalRef, merged);
+
+    if (pagamento?.status === 'approved') {
+      upsertPaid.run({
+        external_ref: externalRef,
+        amount: pagamento.transaction_amount,
+        merchant_order_id: pagamento?.order?.id ? String(pagamento.order.id) : null,
+        payment_id: String(pagamento.id),
+        paid_at: new Date().toISOString(),
+        selections: JSON.stringify(prev.selections || {}),
       });
     }
 
-    // 2) Fallback: consulta o SQLite (útil após restart)
-    const row = db.prepare('SELECT status, payment_id, merchant_order_id, updated_at FROM orders WHERE external_ref = ?')
-                  .get(externalRef);
-    if (row) {
-      return res.status(200).json({
-        external_reference: externalRef,
-        status: row.status,
-        payment_id: row.payment_id,
-        merchant_order_id: row.merchant_order_id,
-        updated_at: row.updated_at,
-        last_status_raw: row.status,
-      });
-    }
-
-    // 3) Nada ainda → aguardando
-    return res.status(200).json({
-      external_reference: externalRef,
-      status: 'aguardando',
-      updated_at: null,
-    });
+    return res.status(200).send('ok');
   } catch (err) {
-    console.error('[ORDER][GET][ERR]', err?.message || err);
-    return res.status(500).json({ error: 'Erro ao consultar pedido' });
+    console.error('[WEBHOOK][ERR]', err?.message || err);
+    return res.status(500).send('error');
   }
 });
 
-// Debug (REMOVER no go-live)
-app.get('/orders/_debug', (_req, res) => {
-  const all = [];
-  for (const [k, v] of ordersStatus.entries()) {
-    all.push({ external_reference: k, ...v });
-  }
-  return res.status(200).json(all);
-});
+// === Mercado Pago: status sem banco (stateless) ===
+const MP_BASE = 'https://api.mercadopago.com';
 
-/* -------------------- Retorno (backup com poll + redirect p/ FRONT) -------------------- */
-async function waitForMerchantOrderPaid(merchantOrderId, { tries = 20, intervalMs = 3000 } = {}) {
-  const moClient = new MerchantOrder(mpClient);
-  for (let i = 1; i <= tries; i++) {
-    try {
-      const r = await moClient.get({ merchantOrderId: String(merchantOrderId) });
-      const paidEnough = (r.paid_amount || 0) >= (r.total_amount || 0);
-      const anyApproved = (r.payments || []).some(p => p.status === 'approved');
-      if (paidEnough && anyApproved) return r;
-      console.log(`[MO][POLL ${i}/${tries}] status=${r.status} paid=${r.paid_amount}/${r.total_amount}`);
-    } catch (e) {
-      console.warn('[MO][POLL][ERR]', e?.message || e);
-    }
-    await new Promise(res => setTimeout(res, intervalMs));
-  }
-  throw new Error('Merchant Order ainda não confirmada como paga dentro do tempo de espera.');
+if (!MP_ACCESS_TOKEN) {
+  console.error('[BOOT] MP_ACCESS_TOKEN ausente — configure nas env vars!');
 }
 
-app.get('/retorno', (req, res) => {
-  console.log('[RETORNO v5]', req.query, 'FRONTEND_RESULT_URL=', FRONTEND_RESULT_URL);
+// Se seu Node no Render for 18+ já existe global fetch.
+// Se aparecer "fetch is not defined", me chama que eu te mando a linha com node-fetch.
+async function mpGetJson(url) {
+  const r = await fetch(url, {
+    headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
+  });
+  if (!r.ok) {
+    const text = await r.text();
+    throw new Error(`MP ${r.status}: ${text}`);
+  }
+  return r.json();
+}
 
-  const externalRef = '' + (req.query.external_reference || req.query.external_ref || '');
-  if (!externalRef) return res.status(400).send('missing externalRef');
-
-  let target;
-  if (FRONTEND_RESULT_URL.includes('#')) {
-    const [base, hash = ''] = FRONTEND_RESULT_URL.split('#');
-    const [path, q = ''] = hash.split('?');
-    const sp = new URLSearchParams(q);
-    sp.set('externalRef', externalRef);
-    target = `${base}#${path}?${sp.toString()}`;
-  } else {
-    const u = new URL(FRONTEND_RESULT_URL);
-    u.searchParams.set('externalRef', externalRef);
-    target = u.toString();
+async function resolveOrderStatus(externalRef) {
+  // 1) Merchant Order (melhor visão agregada)
+  try {
+    const data = await mpGetJson(
+      `${MP_BASE}/merchant_orders/search?external_reference=${encodeURIComponent(externalRef)}`
+    );
+    const mo = Array.isArray(data.elements) ? data.elements[0] : null;
+    if (mo) {
+      const paid = (mo.payments || []).reduce(
+        (sum, p) => sum + (p.total_paid_amount || 0),
+        0
+      );
+      const total = mo.total_amount ?? mo.order_amount ?? 0;
+      return {
+        source: 'merchant_order',
+        status: mo.status, // opened | closed | expired
+        paid_amount: paid,
+        total_amount: total,
+        merchant_order_id: mo.id,
+      };
+    }
+  } catch (e) {
+    console.warn('[MP] merchant_orders/search falhou:', e.message);
   }
 
-  console.log('[RETORNO v5][REDIRECT] →', target);
-  return res.redirect(302, target);
+  // 2) Fallback: Payments Search
+  try {
+    const pr = await mpGetJson(
+      `${MP_BASE}/v1/payments/search?external_reference=${encodeURIComponent(externalRef)}`
+    );
+    const pay = Array.isArray(pr.results) ? pr.results[0] : null;
+    if (pay) {
+      return {
+        source: 'payments',
+        status: pay.status, // approved | pending | rejected | in_process
+        paid_amount:
+          pay.transaction_details?.total_paid_amount ??
+          pay.transaction_amount ??
+          0,
+        total_amount: pay.transaction_amount ?? 0,
+        payment_id: pay.id,
+      };
+    }
+  } catch (e) {
+    console.warn('[MP] payments/search falhou:', e.message);
+  }
+
+  return { source: 'none', status: 'not_found' };
+}
+
+// GET /order/status?externalRef=PED-123
+app.get('/order/status', async (req, res) => {
+  const externalRef = req.query.externalRef;
+  if (!externalRef) {
+    return res.status(400).json({ error: 'externalRef é obrigatório' });
+  }
+  try {
+    const info = await resolveOrderStatus(externalRef);
+    res.json({ external_ref: externalRef, ...info });
+  } catch (err) {
+    console.error('[ORDER][status] erro', err);
+    res.status(500).json({ error: 'Falha ao consultar status' });
+  }
 });
 
 
+/* -------------------- Consulta de status -------------------- */
+app.get('/orders/:externalRef', (req, res) => {
+  const externalRef = String(req.params.externalRef || '').trim();
 
+  const row = ordersStatus.get(externalRef);
+  if (row) return res.json(row);
 
-/* -------------------- IPN legado -------------------- */
-app.all('/ipn', async (req, res) => {
-  try {
-    console.log('=== [IPN] QUERY ===\n', req.query);
-    return res.sendStatus(200);
-  } catch (e) {
-    console.error('[IPN][ERR]', e?.message || e);
-    return res.sendStatus(200);
+  const dbRow = db.prepare(`
+    SELECT status, payment_id, merchant_order_id, updated_at, selections
+    FROM orders WHERE external_ref = ?
+  `).get(externalRef);
+
+  if (dbRow) {
+    let selections = {};
+    try {
+      selections = dbRow.selections ? JSON.parse(dbRow.selections) : {};
+    } catch (_) {
+      selections = {};
+    }
+
+    return res.json({
+      external_reference: externalRef,
+      status: dbRow.status,
+      payment_id: dbRow.payment_id,
+      merchant_order_id: dbRow.merchant_order_id,
+      updated_at: dbRow.updated_at,
+      last_status_raw: dbRow.status,
+      ...selections,
+    });
   }
+
+  return res.status(404).json({ error: 'Pedido não encontrado' });
+});
+
+/* -------------------- Retorno -------------------- */
+app.get('/retorno', (req, res) => {
+  const externalRef = req.query.externalRef || req.query.external_reference;
+  const url = buildFrontResultUrl(FRONTEND_RESULT_URL, externalRef);
+  console.log('[RETORNO]', externalRef, '→', url);
+  if (url) return res.redirect(url);
+  return res.status(400).send('externalRef inválido');
 });
 
 /* ====================== FIM DAS ROTAS ====================== */
-
-// 404 padrão (opcional)
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
 const PORT = process.env.PORT || 3000;
