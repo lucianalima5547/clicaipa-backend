@@ -1,12 +1,12 @@
-const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const Database = require('better-sqlite3');
 const mp = require('mercadopago');
 const { MercadoPagoConfig, Preference } = mp;
+const path = require('path');
 
-// 🔹 Firebase Admin (suporta env e arquivo local)
+// 🔹 Firebase Admin
 const admin = require("firebase-admin");
 let serviceAccount;
 
@@ -28,10 +28,7 @@ if (process.env.FIREBASE_CONFIG) {
   }
 }
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
-
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const fdb = admin.firestore();
 const app = express();
 
@@ -40,9 +37,7 @@ if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
 }
 
-const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || 'https://api.clicaipa.com.br')
-  .replace(/\/+$/, '');
-
+const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || 'https://api.clicaipa.com.br').replace(/\/+$/, '');
 const FRONTEND_RESULT_URL = process.env.FRONTEND_RESULT_URL || 'https://app.clicaipa.com.br/#/resultado';
 console.log('[BOOT] FRONTEND_RESULT_URL=', FRONTEND_RESULT_URL);
 
@@ -75,7 +70,6 @@ async function mpGet(pathname) {
 const ordersStatus = new Map();
 function setOrdersStatus(externalRef, payload) {
   const prev = ordersStatus.get(externalRef) || {};
-
   const merged = {
     ...prev,
     ...payload,
@@ -85,13 +79,12 @@ function setOrdersStatus(externalRef, payload) {
       ...(payload.selections || {}),
     },
   };
-
   ordersStatus.set(externalRef, merged);
   console.log('[ORDERS][SET]', externalRef, merged);
 }
 const setOrderStatus = (ref, payload) => setOrdersStatus(ref, payload);
 
-/* ======================== MIDDLEWARES BASE ======================== */
+/* ======================== MIDDLEWARES ======================== */
 const allowedOrigins = [
   /^http:\/\/localhost:\d+$/,
   'http://localhost',
@@ -123,7 +116,7 @@ app.get('/ping', (_req, res) => res.json({ ok: true, time: new Date().toISOStrin
 app.get('/', (_req, res) => res.send('OK – Clicaipá backend no ar'));
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
-/* -------------------- SQLite (persistência) -------------------- */
+/* -------------------- SQLite -------------------- */
 const db = new Database(path.join(__dirname, 'data.sqlite'));
 db.pragma('journal_mode = WAL');
 db.exec(`
@@ -135,24 +128,35 @@ db.exec(`
     payment_id   TEXT,
     paid_at      TEXT,
     selections   TEXT,
+    cardapios    TEXT,
     created_at   TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
   );
 `);
 
+try {
+  db.prepare("ALTER TABLE orders ADD COLUMN cardapios TEXT").run();
+  console.log("[BOOT][DB] Coluna 'cardapios' adicionada em orders.");
+} catch (e) {
+  if (!String(e.message).includes("duplicate column name")) {
+    console.error("[BOOT][DB] Erro ao alterar tabela orders:", e.message);
+  }
+}
+
 const upsertBase = db.prepare(`
-  INSERT INTO orders (external_ref, status, amount, selections, created_at, updated_at)
-  VALUES (@external_ref, @status, @amount, @selections, datetime('now'), datetime('now'))
+  INSERT INTO orders (external_ref, status, amount, selections, cardapios, created_at, updated_at)
+  VALUES (@external_ref, @status, @amount, @selections, @cardapios, datetime('now'), datetime('now'))
   ON CONFLICT(external_ref) DO UPDATE SET
     status=excluded.status,
     amount=excluded.amount,
     selections=excluded.selections,
+    cardapios=excluded.cardapios,
     updated_at=datetime('now');
 `);
 
 const upsertPaid = db.prepare(`
-  INSERT INTO orders (external_ref, status, amount, merchant_order_id, payment_id, paid_at, selections, updated_at)
-  VALUES (@external_ref, 'pago', @amount, @merchant_order_id, @payment_id, @paid_at, @selections, datetime('now'))
+  INSERT INTO orders (external_ref, status, amount, merchant_order_id, payment_id, paid_at, selections, cardapios, updated_at)
+  VALUES (@external_ref, 'pago', @amount, @merchant_order_id, @payment_id, @paid_at, @selections, @cardapios, datetime('now'))
   ON CONFLICT(external_ref) DO UPDATE SET
     status='pago',
     amount=excluded.amount,
@@ -160,6 +164,7 @@ const upsertPaid = db.prepare(`
     payment_id=excluded.payment_id,
     paid_at=excluded.paid_at,
     selections=excluded.selections,
+    cardapios=excluded.cardapios,
     updated_at=datetime('now');
 `);
 
@@ -193,7 +198,7 @@ function buildFrontResultUrl(frontBase, externalRef) {
   }
 }
 
-/* -------------------- Create Preference (Checkout Pro) -------------------- */
+/* -------------------- Create Preference -------------------- */
 app.post('/create_preference', async (req, res) => {
   try {
     const {
@@ -226,21 +231,26 @@ app.post('/create_preference', async (req, res) => {
         currency_id: 'BRL',
       }],
       notification_url: `${PUBLIC_BASE_URL}/webhook`,
+
+      // ✅ back_urls via backend (/retorno) com nosso external_ref (evita duplicação)
       back_urls: {
-        success: `${FRONTEND_RESULT_URL}?status=success&externalRef=${encodeURIComponent(resolvedOrderId)}`,
-        failure: `${FRONTEND_RESULT_URL}?status=failure&externalRef=${encodeURIComponent(resolvedOrderId)}`,
-        pending: `${FRONTEND_RESULT_URL}?status=pending&externalRef=${encodeURIComponent(resolvedOrderId)}`,
+        success: `${PUBLIC_BASE_URL}/retorno?external_ref=${encodeURIComponent(resolvedOrderId)}`,
+        failure: `${PUBLIC_BASE_URL}/retorno?external_ref=${encodeURIComponent(resolvedOrderId)}`,
+        pending: `${PUBLIC_BASE_URL}/retorno?external_ref=${encodeURIComponent(resolvedOrderId)}`,
       },
+
       auto_return: 'approved',
       external_reference: resolvedOrderId,
       statement_descriptor: 'CLICAIPA',
-      metadata: {
-        external_reference: resolvedOrderId,
-        source: 'clicaipa-app',
-      },
+      metadata: { source: 'clicaipa-app' }, // ✅ sem duplicar external_reference
     };
 
-    console.log('[PREFERENCE][CONF]', { PUBLIC_BASE_URL, back_urls: body.back_urls });
+    // 🔎 Conferência no Render
+    console.log('[PREFERENCE][CONF][v7]', {
+      PUBLIC_BASE_URL,
+      back_urls: body.back_urls,
+      external_reference: body.external_reference,
+    });
 
     const mpRes = await pref.create({ body });
 
@@ -270,6 +280,7 @@ app.post('/create_preference', async (req, res) => {
         modo,
         pessoas,
       }),
+      cardapios: null,
     });
 
     return res.status(201).json({
@@ -287,20 +298,13 @@ app.post('/create_preference', async (req, res) => {
 app.post('/webhook', async (req, res) => {
   try {
     const body = req.body || {};
-    console.log('[WEBHOOK][BODY]', JSON.stringify(body));
+    // Suporta tanto { data: { id } } quanto { id } (formas comuns do MP)
+    const paymentId = body?.data?.id || body?.id || body?.resource;
+    if (!paymentId) return res.status(400).json({ error: 'paymentId ausente' });
 
-    const paymentId = body?.data?.id || body?.id;
-    if (!paymentId) {
-      return res.status(400).json({ error: 'paymentId ausente' });
-    }
-
-    const pagamento = await mpGet(`/v1/payments/${paymentId}`);
-    console.log('[WEBHOOK][PAYMENT]', pagamento?.id, pagamento?.status, pagamento?.external_reference);
-
+    const pagamento = await mpGet(`/v1/payments/${String(paymentId)}`);
     const externalRef = pagamento?.external_reference;
-    if (!externalRef) {
-      return res.status(200).send('ok sem externalRef');
-    }
+    if (!externalRef) return res.status(200).send('ok sem externalRef');
 
     const prev = ordersStatus.get(externalRef) || {};
     const merged = {
@@ -314,7 +318,6 @@ app.post('/webhook', async (req, res) => {
       updated_at: new Date().toISOString(),
     };
     ordersStatus.set(externalRef, merged);
-    console.log('[WEBHOOK][SET]', externalRef, merged);
 
     if (pagamento?.status === 'approved') {
       upsertPaid.run({
@@ -324,6 +327,7 @@ app.post('/webhook', async (req, res) => {
         payment_id: String(pagamento.id),
         paid_at: new Date().toISOString(),
         selections: JSON.stringify(prev.selections || {}),
+        cardapios: JSON.stringify(prev.cardapios || []),
       });
     }
 
@@ -334,138 +338,116 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// === Mercado Pago: status sem banco (stateless) ===
-const MP_BASE = 'https://api.mercadopago.com';
+/* -------------------- Salvar e Buscar Cardápios -------------------- */
+app.post('/order/save', (req, res) => {
+  const { externalRef, cardapios } = req.body;
+  if (!externalRef || !cardapios) {
+    return res.status(400).json({ error: 'externalRef e cardapios são obrigatórios' });
+  }
 
-if (!MP_ACCESS_TOKEN) {
-  console.error('[BOOT] MP_ACCESS_TOKEN ausente — configure nas env vars!');
-}
+  const prev = ordersStatus.get(externalRef) || {};
+  const merged = { ...prev, cardapios };
+  ordersStatus.set(externalRef, merged);
 
-// Se seu Node no Render for 18+ já existe global fetch.
-// Se aparecer "fetch is not defined", me chama que eu te mando a linha com node-fetch.
-async function mpGetJson(url) {
-  const r = await fetch(url, {
-    headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
+  upsertBase.run({
+    external_ref: externalRef,
+    status: prev.status || 'aguardando',
+    amount: prev.amount || 0,
+    selections: JSON.stringify(prev.selections || {}),
+    cardapios: JSON.stringify(cardapios),
   });
-  if (!r.ok) {
-    const text = await r.text();
-    throw new Error(`MP ${r.status}: ${text}`);
-  }
-  return r.json();
-}
 
-async function resolveOrderStatus(externalRef) {
-  // 1) Merchant Order (melhor visão agregada)
-  try {
-    const data = await mpGetJson(
-      `${MP_BASE}/merchant_orders/search?external_reference=${encodeURIComponent(externalRef)}`
-    );
-    const mo = Array.isArray(data.elements) ? data.elements[0] : null;
-    if (mo) {
-      const paid = (mo.payments || []).reduce(
-        (sum, p) => sum + (p.total_paid_amount || 0),
-        0
-      );
-      const total = mo.total_amount ?? mo.order_amount ?? 0;
-      return {
-        source: 'merchant_order',
-        status: mo.status, // opened | closed | expired
-        paid_amount: paid,
-        total_amount: total,
-        merchant_order_id: mo.id,
-      };
-    }
-  } catch (e) {
-    console.warn('[MP] merchant_orders/search falhou:', e.message);
-  }
-
-  // 2) Fallback: Payments Search
-  try {
-    const pr = await mpGetJson(
-      `${MP_BASE}/v1/payments/search?external_reference=${encodeURIComponent(externalRef)}`
-    );
-    const pay = Array.isArray(pr.results) ? pr.results[0] : null;
-    if (pay) {
-      return {
-        source: 'payments',
-        status: pay.status, // approved | pending | rejected | in_process
-        paid_amount:
-          pay.transaction_details?.total_paid_amount ??
-          pay.transaction_amount ??
-          0,
-        total_amount: pay.transaction_amount ?? 0,
-        payment_id: pay.id,
-      };
-    }
-  } catch (e) {
-    console.warn('[MP] payments/search falhou:', e.message);
-  }
-
-  return { source: 'none', status: 'not_found' };
-}
-
-// GET /order/status?externalRef=PED-123
-app.get('/order/status', async (req, res) => {
-  const externalRef = req.query.externalRef;
-  if (!externalRef) {
-    return res.status(400).json({ error: 'externalRef é obrigatório' });
-  }
-  try {
-    const info = await resolveOrderStatus(externalRef);
-    res.json({ external_ref: externalRef, ...info });
-  } catch (err) {
-    console.error('[ORDER][status] erro', err);
-    res.status(500).json({ error: 'Falha ao consultar status' });
-  }
+  res.json({ ok: true });
 });
 
-
-/* -------------------- Consulta de status -------------------- */
-app.get('/orders/:externalRef', (req, res) => {
-  const externalRef = String(req.params.externalRef || '').trim();
+app.get('/order/result', (req, res) => {
+  const externalRef = req.query.externalRef;
+  if (!externalRef) return res.status(400).json({ error: 'externalRef é obrigatório' });
 
   const row = ordersStatus.get(externalRef);
-  if (row) return res.json(row);
+  if (row?.cardapios) return res.json({ externalRef, cardapios: row.cardapios });
 
-  const dbRow = db.prepare(`
-    SELECT status, payment_id, merchant_order_id, updated_at, selections
-    FROM orders WHERE external_ref = ?
-  `).get(externalRef);
-
-  if (dbRow) {
-    let selections = {};
+  const dbRow = db.prepare(`SELECT cardapios FROM orders WHERE external_ref = ?`).get(externalRef);
+  if (dbRow?.cardapios) {
     try {
-      selections = dbRow.selections ? JSON.parse(dbRow.selections) : {};
-    } catch (_) {
-      selections = {};
+      return res.json({ externalRef, cardapios: JSON.parse(dbRow.cardapios) });
+    } catch {
+      return res.json({ externalRef, cardapios: [] });
     }
-
-    return res.json({
-      external_reference: externalRef,
-      status: dbRow.status,
-      payment_id: dbRow.payment_id,
-      merchant_order_id: dbRow.merchant_order_id,
-      updated_at: dbRow.updated_at,
-      last_status_raw: dbRow.status,
-      ...selections,
-    });
   }
 
-  return res.status(404).json({ error: 'Pedido não encontrado' });
+  return res.status(404).json({ error: 'Cardápios não encontrados' });
 });
 
-/* -------------------- Retorno -------------------- */
-app.get('/retorno', (req, res) => {
-  const externalRef = req.query.externalRef || req.query.external_reference;
-  const url = buildFrontResultUrl(FRONTEND_RESULT_URL, externalRef);
-  console.log('[RETORNO]', externalRef, '→', url);
-  if (url) return res.redirect(url);
-  return res.status(400).send('externalRef inválido');
+/* -------------------- Retorno (robusto) -------------------- */
+app.get('/retorno', async (req, res) => {
+  try {
+    let externalRef =
+      req.query.external_ref ||
+      req.query.externalRef ||
+      req.query.external_reference ||
+      '';
+
+    if (Array.isArray(externalRef)) externalRef = externalRef[0];
+    if (typeof externalRef === 'string' && externalRef.includes(',')) {
+      externalRef = externalRef.split(',')[0].trim(); // mantém o primeiro
+    }
+
+    // Tenta resolver pelo payment/merchant_order se vierem na URL
+    let paymentId =
+      req.query.payment_id || req.query.collection_id || req.query['data.id'] || req.query.id || null;
+    let merchantOrderId = req.query.merchant_order_id || req.query.merchant_order || null;
+
+    if (!paymentId) {
+      for (const [k, v] of Object.entries(req.query)) {
+        if (/^payment/i.test(k) || /^collection/i.test(k)) { paymentId = String(v); break; }
+      }
+    }
+    if (!merchantOrderId) {
+      for (const [k, v] of Object.entries(req.query)) {
+        if (/merchant.*order/i.test(k)) { merchantOrderId = String(v); break; }
+      }
+    }
+
+    if (!externalRef && paymentId) {
+      try {
+        const pay = await mpGet(`/v1/payments/${String(paymentId).split(',')[0].trim()}`);
+        if (pay?.external_reference) externalRef = String(pay.external_reference);
+      } catch (e) {
+        console.warn('[RETORNO][PAYMENT_LOOKUP][WARN]', e?.message || e);
+      }
+    }
+
+    if (!externalRef && merchantOrderId) {
+      try {
+        const mo = await mpGet(`/merchant_orders/${String(merchantOrderId).split(',')[0].trim()}`);
+        if (mo?.external_reference) {
+          externalRef = String(mo.external_reference);
+        } else if (Array.isArray(mo?.payments) && mo.payments[0]?.id) {
+          const pay = await mpGet(`/v1/payments/${mo.payments[0].id}`);
+          if (pay?.external_reference) externalRef = String(pay.external_reference);
+        }
+      } catch (e) {
+        console.warn('[RETORNO][MO_LOOKUP][WARN]', e?.message || e);
+      }
+    }
+
+    console.log('[RETORNO][DEBUG]', { query: req.query, resolved: { externalRef, paymentId, merchantOrderId } });
+
+    if (!externalRef) return res.status(400).send('externalRef ausente e não foi possível resolver pelos IDs');
+
+    const url = buildFrontResultUrl(FRONTEND_RESULT_URL, externalRef);
+    console.log('[RETORNO][FINAL]', { externalRef, redirect: url });
+    if (url) return res.redirect(url);
+    return res.status(400).send('externalRef inválido');
+  } catch (err) {
+    console.error('[RETORNO][ERR]', err?.message || err);
+    return res.status(500).send('erro no retorno');
+  }
 });
 
-/* ====================== FIM DAS ROTAS ====================== */
+/* ====================== FIM ====================== */
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`API rodando em http://localhost:${PORT}`);
