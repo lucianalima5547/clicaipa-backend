@@ -295,30 +295,58 @@ app.post('/create_preference', async (req, res) => {
 });
 
 /* -------------------- Webhook -------------------- */
+/* -------------------- Webhook (mais tolerante + logs) -------------------- */
 app.post('/webhook', async (req, res) => {
+  console.log('[WEBHOOK][RAW BODY]', req.body);
   try {
-    const body = req.body || {};
-    // Suporta tanto { data: { id } } quanto { id } (formas comuns do MP)
-    const paymentId = body?.data?.id || body?.id || body?.resource;
-    if (!paymentId) return res.status(400).json({ error: 'paymentId ausente' });
+    // Logs mínimos pra depurar
+    console.log('[WEBHOOK][HEADERS]', {
+      'content-type': req.headers['content-type'],
+      'x-request-id': req.headers['x-request-id'],
+      'x-signature': req.headers['x-signature'] ? '[present]' : undefined,
+      'user-agent': req.headers['user-agent'],
+    });
+    console.log('[WEBHOOK][BODY]', JSON.stringify(req.body));
 
+    const body = req.body || {};
+
+    // Aceita múltiplos formatos (MP e nossos testes)
+    const paymentId =
+      body?.data?.id ||      // formato comum do MP: { data: { id } }
+      body?.id ||            // às vezes vem { id }
+      body?.resource ||      // legado: { resource: "<id>" }
+      body?.paymentId ||     // TESTE: nosso campo artificial
+      req.query?.paymentId;  // fallback de querystring em teste
+
+    if (!paymentId) {
+      // 👉 Em vez de 400, vamos responder 200 para não gerar retries infinitos durante testes.
+      return res.status(200).json({ ok: true, note: 'sem paymentId (teste)' });
+    }
+
+    // Confere o pagamento na API oficial
     const pagamento = await mpGet(`/v1/payments/${String(paymentId)}`);
     const externalRef = pagamento?.external_reference;
-    if (!externalRef) return res.status(200).send('ok sem externalRef');
 
+    if (!externalRef) {
+      console.log('[WEBHOOK] pagamento sem external_reference', { id: paymentId, status: pagamento?.status });
+      return res.status(200).send('ok sem externalRef');
+    }
+
+    // Atualiza memória
     const prev = ordersStatus.get(externalRef) || {};
     const merged = {
       ...prev,
       status: pagamento?.status || 'desconhecido',
       payment_id: String(pagamento?.id || ''),
       merchant_order_id: pagamento?.order?.id ? String(pagamento.order.id) : null,
-      amount: pagamento?.transaction_amount || prev.amount,
+      amount: pagamento?.transaction_amount ?? prev.amount,
       paid_at: pagamento?.status === 'approved' ? new Date().toISOString() : prev.paid_at,
       last_status_raw: pagamento?.status,
       updated_at: new Date().toISOString(),
     };
     ordersStatus.set(externalRef, merged);
 
+    // Persiste se aprovado
     if (pagamento?.status === 'approved') {
       upsertPaid.run({
         external_ref: externalRef,
@@ -334,7 +362,7 @@ app.post('/webhook', async (req, res) => {
     return res.status(200).send('ok');
   } catch (err) {
     console.error('[WEBHOOK][ERR]', err?.message || err);
-    return res.status(500).send('error');
+    return res.status(200).send('ok'); // Durante testes, não queremos retries em loop
   }
 });
 
@@ -444,6 +472,27 @@ app.get('/retorno', async (req, res) => {
     console.error('[RETORNO][ERR]', err?.message || err);
     return res.status(500).send('erro no retorno');
   }
+});
+
+/* -------------------- Webhook TESTE -------------------- */
+app.post('/webhook-test', (req, res) => {
+  console.log('[WH-TEST][HEADERS]', {
+    'content-type': req.headers['content-type'],
+    'x-request-id': req.headers['x-request-id'],
+    'x-signature': req.headers['x-signature'] ? '[present]' : undefined,
+    'user-agent': req.headers['user-agent'],
+  });
+  console.log('[WH-TEST][QUERY]', req.query);
+  console.log('[WH-TEST][BODY]', req.body);
+
+  return res.status(200).json({
+    ok: true,
+    seen: {
+      contentType: req.headers['content-type'],
+      query: req.query,
+      body: req.body,
+    },
+  });
 });
 
 /* ====================== FIM ====================== */
