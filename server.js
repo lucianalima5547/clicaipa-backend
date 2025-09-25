@@ -294,77 +294,124 @@ app.post('/create_preference', async (req, res) => {
   }
 });
 
-/* -------------------- Webhook -------------------- */
-/* -------------------- Webhook (mais tolerante + logs) -------------------- */
-app.post('/webhook', async (req, res) => {
-  console.log('[WEBHOOK][RAW BODY]', req.body);
+/* -------------------- Webhook (definitivo) -------------------- */
+app.post('/webhook', express.json(), async (req, res) => {
   try {
-    // Logs mínimos pra depurar
-    console.log('[WEBHOOK][HEADERS]', {
-      'content-type': req.headers['content-type'],
-      'x-request-id': req.headers['x-request-id'],
-      'x-signature': req.headers['x-signature'] ? '[present]' : undefined,
-      'user-agent': req.headers['user-agent'],
-    });
-    console.log('[WEBHOOK][BODY]', JSON.stringify(req.body));
+    const { topic, resource, data, action } = req.body || {};
+    console.log('[WEBHOOK][IN]', { topic, resource, action, data });
 
-    const body = req.body || {};
+    let pathname = null;
 
-    // Aceita múltiplos formatos (MP e nossos testes)
-    const paymentId =
-      body?.data?.id ||      // formato comum do MP: { data: { id } }
-      body?.id ||            // às vezes vem { id }
-      body?.resource ||      // legado: { resource: "<id>" }
-      body?.paymentId ||     // TESTE: nosso campo artificial
-      req.query?.paymentId;  // fallback de querystring em teste
-
-    if (!paymentId) {
-      // 👉 Em vez de 400, vamos responder 200 para não gerar retries infinitos durante testes.
-      return res.status(200).json({ ok: true, note: 'sem paymentId (teste)' });
+    // payment.* pode vir como topic:"payment" ou action:"payment.created"
+    if (topic === 'payment' || (typeof action === 'string' && action.startsWith('payment'))) {
+      const paymentId = (typeof resource === 'string' && /^\d+$/.test(resource))
+        ? resource
+        : (data?.id || null);
+      if (paymentId) pathname = `/v1/payments/${paymentId}`;
     }
 
-    // Confere o pagamento na API oficial
-    const pagamento = await mpGet(`/v1/payments/${String(paymentId)}`);
-    const externalRef = pagamento?.external_reference;
+    // merchant_order sempre vem como URL mercadolibre; extraímos o id
+    if (!pathname && topic === 'merchant_order' && typeof resource === 'string') {
+      const id = resource.split('/').pop();
+      if (id && /^\d+$/.test(id)) pathname = `/merchant_orders/${id}`;
+    }
+
+    if (!pathname) {
+      console.log('[WEBHOOK][SKIP] sem pathname resolvido.');
+      return res.sendStatus(200);
+    }
+
+    console.log('[WEBHOOK][URL]', `https://api.mercadopago.com${pathname}`);
+
+    // Consulta a API do MP (usa seu helper com baseURL já certa)
+    let payload;
+    try {
+      payload = await mpGet(pathname);
+    } catch (e) {
+      const code = e?.response?.status || e.code;
+      console.warn('[WEBHOOK][FETCH ERR]', code, pathname, e?.response?.data || e.message);
+      // Mesmo com erro, sempre responde 200 para o MP não reenfileirar sem fim
+      return res.sendStatus(200);
+    }
+
+    // Normaliza status/externalRef
+    let externalRef = payload?.external_reference || null;
+    let status = null;
+    let paymentId = null;
+    let merchantOrderId = null;
+    let amount = null;
+    let paidAt = null;
+
+    if (pathname.startsWith('/v1/payments/')) {
+      // Resposta de /v1/payments/:id
+      paymentId = payload?.id || null;
+      status = payload?.status || null; // approved | pending | rejected...
+      amount = payload?.transaction_amount ?? null;
+      paidAt = payload?.date_approved || null;
+      // external_reference já veio acima
+    } else {
+      // Resposta de /merchant_orders/:id
+      merchantOrderId = payload?.id || null;
+      if (!externalRef) externalRef = payload?.external_reference || null;
+      // tenta inferir status pelo primeiro pagamento
+      if (Array.isArray(payload?.payments) && payload.payments.length > 0) {
+        const first = payload.payments[0];
+        paymentId = first?.id || null;
+        status = first?.status || status || null;
+        if (!paidAt && first?.date_approved) paidAt = first.date_approved;
+        if (!amount && first?.total_paid_amount != null) amount = first.total_paid_amount;
+      }
+    }
+
+    console.log('[WEBHOOK][PARSED]', { externalRef, status, paymentId, merchantOrderId });
 
     if (!externalRef) {
-      console.log('[WEBHOOK] pagamento sem external_reference', { id: paymentId, status: pagamento?.status });
-      return res.status(200).send('ok sem externalRef');
+      console.log('[WEBHOOK][WARN] sem external_reference no payload.');
+      return res.sendStatus(200);
     }
 
-    // Atualiza memória
-    const prev = ordersStatus.get(externalRef) || {};
-    const merged = {
-      ...prev,
-      status: pagamento?.status || 'desconhecido',
-      payment_id: String(pagamento?.id || ''),
-      merchant_order_id: pagamento?.order?.id ? String(pagamento.order.id) : null,
-      amount: pagamento?.transaction_amount ?? prev.amount,
-      paid_at: pagamento?.status === 'approved' ? new Date().toISOString() : prev.paid_at,
-      last_status_raw: pagamento?.status,
-      updated_at: new Date().toISOString(),
-    };
-    ordersStatus.set(externalRef, merged);
+    // --- Atualiza memória ---
+    setOrderStatus(externalRef, {
+      status: status || 'desconhecido',
+      payment_id: paymentId || undefined,
+      merchant_order_id: merchantOrderId || undefined,
+      amount: (typeof amount === 'number') ? amount : undefined,
+      paid_at: paidAt || undefined,
+    });
 
-    // Persiste se aprovado
-    if (pagamento?.status === 'approved') {
-      upsertPaid.run({
-        external_ref: externalRef,
-        amount: pagamento.transaction_amount,
-        merchant_order_id: pagamento?.order?.id ? String(pagamento.order.id) : null,
-        payment_id: String(pagamento.id),
-        paid_at: new Date().toISOString(),
-        selections: JSON.stringify(prev.selections || {}),
-        cardapios: JSON.stringify(prev.cardapios || []),
-      });
+    // --- Atualiza SQLite ---
+    try {
+      if (status === 'approved') {
+        upsertPaid.run({
+          external_ref: externalRef,
+          amount: amount ?? 0,
+          merchant_order_id: merchantOrderId ?? null,
+          payment_id: paymentId ?? null,
+          paid_at: paidAt ?? new Date().toISOString(),
+          selections: JSON.stringify((ordersStatus.get(externalRef) || {}).selections || {}),
+          cardapios: JSON.stringify((ordersStatus.get(externalRef) || {}).cardapios || null),
+        });
+      } else if (status) {
+        upsertBase.run({
+          external_ref: externalRef,
+          status,
+          amount: amount ?? 0,
+          selections: JSON.stringify((ordersStatus.get(externalRef) || {}).selections || {}),
+          cardapios: JSON.stringify((ordersStatus.get(externalRef) || {}).cardapios || null),
+        });
+      }
+    } catch (dbErr) {
+      console.warn('[WEBHOOK][DB WARN]', dbErr?.message || dbErr);
     }
 
-    return res.status(200).send('ok');
-  } catch (err) {
-    console.error('[WEBHOOK][ERR]', err?.message || err);
-    return res.status(200).send('ok'); // Durante testes, não queremos retries em loop
+    console.log(`[ORDERS][UPDATE] ${externalRef} → ${status || 'desconhecido'}`);
+    return res.sendStatus(200);
+  } catch (e) {
+    console.error('[WEBHOOK][ERR]', e?.message || e);
+    return res.sendStatus(200);
   }
 });
+
 
 /* -------------------- Salvar e Buscar Cardápios -------------------- */
 app.post('/order/save', (req, res) => {
