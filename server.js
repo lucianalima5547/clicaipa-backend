@@ -38,7 +38,7 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || 'https://api.clicaipa.com.br').replace(/\/+$/, '');
-const FRONTEND_RESULT_URL = process.env.FRONTEND_RESULT_URL || 'https://app.clicaipa.com.br/#/resultado';
+const FRONTEND_RESULT_URL = process.env.FRONTEND_RESULT_URL || 'https://app.clicaipa.com.br/#/pospagamento';
 console.log('[BOOT] FRONTEND_RESULT_URL=', FRONTEND_RESULT_URL);
 
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || '';
@@ -198,102 +198,20 @@ function buildFrontResultUrl(frontBase, externalRef) {
   }
 }
 
-/* -------------------- Create Preference -------------------- */
-app.post('/create_preference', async (req, res) => {
-  try {
-    const {
-      title = 'Item de teste',
-      quantity = 1,
-      unit_price = 1.0,
-      orderId,
-      proteinasSelecionadas = [],
-      carboidratosSelecionados = [],
-      legumesSelecionados = [],
-      outrosSelecionados = [],
-      frescosSelecionados = [],
-      modo = 'congelado',
-      pessoas = null,
-    } = req.body || {};
+/* ===================== ROTAS ===================== */
 
-    const resolvedOrderId = String(orderId || gerarOrderId());
-    const qtt = Math.max(1, parseInt(quantity, 10) || 1);
-    const price = Number(unit_price);
-    if (!Number.isFinite(price) || price <= 0) {
-      return res.status(400).json({ error: 'unit_price inválido' });
-    }
+// === 1) específicos (PRECISAM vir antes da dinâmica) =======================
 
-    const pref = new Preference(mpClient);
-    const body = {
-      items: [{
-        title: String(title),
-        quantity: qtt,
-        unit_price: price,
-        currency_id: 'BRL',
-      }],
-      notification_url: `${PUBLIC_BASE_URL}/webhook`,
-
-      // ✅ back_urls via backend (/retorno) com nosso external_ref (evita duplicação)
-      back_urls: {
-        success: `${PUBLIC_BASE_URL}/retorno?external_ref=${encodeURIComponent(resolvedOrderId)}`,
-        failure: `${PUBLIC_BASE_URL}/retorno?external_ref=${encodeURIComponent(resolvedOrderId)}`,
-        pending: `${PUBLIC_BASE_URL}/retorno?external_ref=${encodeURIComponent(resolvedOrderId)}`,
-      },
-
-      auto_return: 'approved',
-      external_reference: resolvedOrderId,
-      statement_descriptor: 'CLICAIPA',
-      metadata: { source: 'clicaipa-app' }, // ✅ sem duplicar external_reference
-    };
-
-    // 🔎 Conferência no Render
-    console.log('[PREFERENCE][CONF][v7]', {
-      PUBLIC_BASE_URL,
-      back_urls: body.back_urls,
-      external_reference: body.external_reference,
-    });
-
-    const mpRes = await pref.create({ body });
-
-    setOrdersStatus(resolvedOrderId, {
-      status: 'aguardando',
-      selections: {
-        proteinasSelecionadas,
-        carboidratosSelecionados,
-        legumesSelecionados,
-        outrosSelecionados,
-        frescosSelecionados,
-        modo,
-        pessoas,
-      },
-    });
-
-    upsertBase.run({
-      external_ref: resolvedOrderId,
-      status: 'aguardando',
-      amount: price,
-      selections: JSON.stringify({
-        proteinasSelecionadas,
-        carboidratosSelecionados,
-        legumesSelecionados,
-        outrosSelecionados,
-        frescosSelecionados,
-        modo,
-        pessoas,
-      }),
-      cardapios: null,
-    });
-
-    return res.status(201).json({
-      preference_id: mpRes?.id,
-      init_point: mpRes?.init_point,
-      external_reference: resolvedOrderId,
-    });
-  } catch (err) {
-    console.error('[PREFERENCE][ERR]', err?.response?.data || err?.message || err);
-    return res.status(500).json({ error: 'Erro ao criar preferência' });
-  }
+// Status simples (polling do app)
+app.get('/order/status', (req, res) => {
+  const ref = req.query.externalRef || req.query.external_ref;
+  if (!ref) return res.status(400).json({ error: 'externalRef ausente' });
+  const row = db.prepare('SELECT status FROM orders WHERE external_ref = ?').get(String(ref));
+  if (!row) return res.status(404).json({ status: 'desconhecido' });
+  return res.json({ status: row.status });
 });
 
+<<<<<<< HEAD
 /* -------------------- Webhook (definitivo) -------------------- */
 app.post('/webhook', express.json(), async (req, res) => {
   try {
@@ -430,11 +348,60 @@ app.post('/order/save', (req, res) => {
     amount: prev.amount || 0,
     selections: JSON.stringify(prev.selections || {}),
     cardapios: JSON.stringify(cardapios),
-  });
+=======
+// Pacote para a tela pós-pagamento
+app.get('/order/selections', (req, res) => {
+  let externalRef =
+    req.query.externalRef ||
+    req.query.external_ref ||
+    req.query.external_reference || '';
 
-  res.json({ ok: true });
+  if (Array.isArray(externalRef)) externalRef = externalRef[0];
+  externalRef = String(externalRef || '').trim();
+  if (!externalRef) return res.status(400).json({ error: 'externalRef é obrigatório' });
+
+  const mem = ordersStatus.get(externalRef);
+  const row = db.prepare(`SELECT status, amount, selections FROM orders WHERE external_ref = ?`).get(externalRef);
+
+  const parseSel = (raw) => {
+    try { return !raw ? null : (typeof raw === 'string' ? JSON.parse(raw) : raw); }
+    catch { return null; }
+  };
+
+  const selMem = parseSel(mem?.selections) || mem?.selections || null;
+  const selDb  = parseSel(row?.selections) || null;
+  const selections = selMem || selDb || {};
+
+  const amount = (typeof mem?.amount === 'number') ? mem.amount
+               : (typeof row?.amount === 'number') ? row.amount
+               : null;
+
+  const status = mem?.status || row?.status || 'pending';
+  const modo = (String(selections?.modo || 'congelado').toLowerCase() === 'semanal') ? 'semanal' : 'congelado';
+  const quantidade = Number.isFinite(selections?.quantidade)
+    ? Number(selections.quantidade)
+    : (modo === 'semanal' ? Math.max(1, parseInt(selections?.pessoas, 10) || 1) : 24);
+
+  const arr = (x) => Array.isArray(x) ? x : [];
+
+  return res.json({
+    externalRef,
+    amount: amount ?? null,
+    selections: {
+      proteinasSelecionadas:    arr(selections?.proteinasSelecionadas),
+      carboidratosSelecionados: arr(selections?.carboidratosSelecionados),
+      legumesSelecionados:      arr(selections?.legumesSelecionados),
+      outrosSelecionados:       arr(selections?.outrosSelecionados),
+      frescosSelecionados:      arr(selections?.frescosSelecionados),
+    },
+    modo,
+    quantidade,
+    status,
+>>>>>>> 62ccae6 (feat(api): add /order/status e /order/selections e ordena rotas)
+  });
 });
 
+// Resultado salvo (mantém antes da dinâmica)
 app.get('/order/result', (req, res) => {
   const externalRef = req.query.externalRef;
   if (!externalRef) return res.status(400).json({ error: 'externalRef é obrigatório' });
@@ -454,6 +421,264 @@ app.get('/order/result', (req, res) => {
   return res.status(404).json({ error: 'Cardápios não encontrados' });
 });
 
+// === 2) dinâmica (vem POR ÚLTIMO) ==========================================
+app.get('/order/:externalRef', (req, res) => {
+  const row = db.prepare('SELECT * FROM orders WHERE external_ref = ?').get(req.params.externalRef);
+  if (!row) return res.status(404).json({ error: 'pedido não encontrado' });
+  res.json({
+    externalRef: req.params.externalRef,
+    status: row.status,
+    amount: row.amount,
+    selections: row.selections ? JSON.parse(row.selections) : {},
+    cardapios: row.cardapios ? JSON.parse(row.cardapios) : [],
+    updated_at: row.updated_at,
+    payment_id: row.payment_id,
+    merchant_order_id: row.merchant_order_id,
+  });
+});
+
+// === 3) alias legado com redirect 307 ======================================
+app.get('/orders/:externalRef', (req, res) => {
+  const { externalRef } = req.params;
+  console.log('[ORDERS][ALIAS] 307 → /order/', externalRef);
+  return res.redirect(307, `/order/${encodeURIComponent(externalRef)}`);
+});
+
+/* -------------------- Create Preference (ATUALIZADO) -------------------- */
+app.post('/create_preference', async (req, res) => {
+  try {
+    const {
+      title = 'Item de teste',
+      quantity = 1,
+      unit_price = 1.0,
+      orderId,
+
+      // ✅ seleções vindas do app
+      proteinasSelecionadas = [],
+      carboidratosSelecionados = [],
+      legumesSelecionados = [],
+      outrosSelecionados = [],
+      frescosSelecionados = [],
+
+      // ✅ modo + quantidade
+      modo = 'congelado',
+      quantidade,
+      quantidadeTotal,
+      quantityTotal,
+      pessoas = null,
+    } = req.body || {};
+
+    const resolvedOrderId = String(orderId || gerarOrderId());
+    const qtt = Math.max(1, parseInt(quantity, 10) || 1);
+    const price = Number(unit_price);
+    if (!Number.isFinite(price) || price <= 0) {
+      return res.status(400).json({ error: 'unit_price inválido' });
+    }
+
+    const _modo = (String(modo).toLowerCase() === 'semanal') ? 'semanal' : 'congelado';
+    const resolvedQuantidade =
+      Number.isFinite(quantidade) ? Number(quantidade) :
+      Number.isFinite(quantidadeTotal) ? Number(quantidadeTotal) :
+      Number.isFinite(quantityTotal) ? Number(quantityTotal) :
+      (_modo === 'semanal'
+        ? Math.max(1, parseInt(pessoas, 10) || 1)
+        : 24);
+
+    const pref = new Preference(mpClient);
+    const body = {
+      items: [{
+        title: String(title),
+        quantity: qtt,
+        unit_price: price,
+        currency_id: 'BRL',
+      }],
+      notification_url: `${PUBLIC_BASE_URL}/webhook`,
+      back_urls: {
+        success: `${PUBLIC_BASE_URL}/retorno?external_ref=${encodeURIComponent(resolvedOrderId)}`,
+        failure: `${PUBLIC_BASE_URL}/retorno?external_ref=${encodeURIComponent(resolvedOrderId)}`,
+        pending: `${PUBLIC_BASE_URL}/retorno?external_ref=${encodeURIComponent(resolvedOrderId)}`,
+      },
+      auto_return: 'approved',
+      external_reference: resolvedOrderId,
+      statement_descriptor: 'CLICAIPA',
+      metadata: { source: 'clicaipa-app' },
+    };
+
+    console.log('[PREFERENCE][CONF][v7]', {
+      PUBLIC_BASE_URL,
+      back_urls: body.back_urls,
+      external_reference: body.external_reference,
+    });
+
+    const mpRes = await pref.create({ body });
+
+    setOrdersStatus(resolvedOrderId, {
+      status: 'aguardando',
+      amount: price,
+      selections: {
+        proteinasSelecionadas,
+        carboidratosSelecionados,
+        legumesSelecionados,
+        outrosSelecionados,
+        frescosSelecionados,
+        modo: _modo,
+        pessoas,
+        quantidade: resolvedQuantidade,
+      },
+    });
+
+    upsertBase.run({
+      external_ref: resolvedOrderId,
+      status: 'aguardando',
+      amount: price,
+      selections: JSON.stringify({
+        proteinasSelecionadas,
+        carboidratosSelecionados,
+        legumesSelecionados,
+        outrosSelecionados,
+        frescosSelecionados,
+        modo: _modo,
+        pessoas,
+        quantidade: resolvedQuantidade,
+      }),
+      cardapios: null,
+    });
+
+    return res.status(201).json({
+      preference_id: mpRes?.id,
+      init_point: mpRes?.init_point,
+      external_reference: resolvedOrderId,
+    });
+  } catch (err) {
+    console.error('[PREFERENCE][ERR]', err?.response?.data || err?.message || err);
+    return res.status(500).json({ error: 'Erro ao criar preferência' });
+  }
+});
+
+/* -------------------- Webhook (definitivo) -------------------- */
+const STATUS_SCORE = {
+  rejected: 0,
+  cancelled: 0,
+  in_mediation: 1,
+  pending: 1,
+  in_process: 2,
+  authorized: 3,
+  approved: 4,
+  refunded: 5,
+  charged_back: 6,
+};
+const score = s => STATUS_SCORE[(s || '').toLowerCase()] ?? -1;
+
+app.post('/webhook', express.json(), async (req, res) => {
+  try {
+    const { topic, resource, data, action } = req.body || {};
+    console.log('[WEBHOOK][IN]', { topic, resource, action, data });
+
+    let pathname = null;
+
+    if (topic === 'payment' || (typeof action === 'string' && action.startsWith('payment'))) {
+      const paymentId =
+        (typeof resource === 'string' && /^\d+$/.test(resource)) ? resource :
+        (data?.id || null);
+      if (paymentId) pathname = `/v1/payments/${paymentId}`;
+    }
+
+    if (!pathname && topic === 'merchant_order' && typeof resource === 'string') {
+      const id = resource.split('/').pop();
+      if (id && /^\d+$/.test(id)) pathname = `/merchant_orders/${id}`;
+    }
+
+    if (!pathname) {
+      console.log('[WEBHOOK][SKIP] sem pathname resolvido.');
+      return res.sendStatus(200);
+    }
+
+    console.log('[WEBHOOK][URL]', `https://api.mercadopago.com${pathname}`);
+
+    let payload;
+    try {
+      payload = await mpGet(pathname);
+    } catch (e) {
+      const code = e?.response?.status || e.code;
+      console.warn('[WEBHOOK][FETCH ERR]', code, pathname, e?.response?.data || e.message);
+      return res.sendStatus(200);
+    }
+
+    let externalRef = payload?.external_reference || null;
+    let status = null;
+    let paymentId = null;
+    let merchantOrderId = null;
+    let amount = null;
+    let paidAt = null;
+
+    if (pathname.startsWith('/v1/payments/')) {
+      paymentId = payload?.id || null;
+      status = payload?.status || null;
+      amount = payload?.transaction_amount ?? null;
+      paidAt = payload?.date_approved || null;
+    } else {
+      merchantOrderId = payload?.id || null;
+      if (!externalRef) externalRef = payload?.external_reference || null;
+      if (Array.isArray(payload?.payments) && payload.payments.length > 0) {
+        const first = payload.payments[0];
+        paymentId = first?.id || null;
+        status = first?.status || status || null;
+        if (!paidAt && first?.date_approved) paidAt = first.date_approved;
+        if (!amount && first?.total_paid_amount != null) amount = first.total_paid_amount;
+      }
+    }
+
+    console.log('[WEBHOOK][PARSED]', { externalRef, status, paymentId, merchantOrderId });
+
+    if (!externalRef) return res.sendStatus(200);
+
+    const prev = ordersStatus.get(externalRef) || {};
+    const prevStatus = prev.status || null;
+    const newStatus = status || prevStatus || 'desconhecido';
+    const canUpgrade = score(newStatus) >= score(prevStatus) || prevStatus == null;
+
+    const merged = {
+      status: canUpgrade ? newStatus : prevStatus,
+      payment_id: paymentId ?? prev.payment_id,
+      merchant_order_id: merchantOrderId ?? prev.merchant_order_id,
+      amount: (typeof amount === 'number' ? amount : prev.amount),
+      paid_at: paidAt || prev.paid_at,
+    };
+
+    setOrderStatus(externalRef, merged);
+
+    try {
+      if (canUpgrade && merged.status === 'approved') {
+        upsertPaid.run({
+          external_ref: externalRef,
+          amount: merged.amount ?? 0,
+          merchant_order_id: merged.merchant_order_id ?? null,
+          payment_id: merged.payment_id ?? null,
+          paid_at: merged.paid_at ?? new Date().toISOString(),
+          selections: JSON.stringify((ordersStatus.get(externalRef) || {}).selections || {}),
+          cardapios: JSON.stringify((ordersStatus.get(externalRef) || {}).cardapios || null),
+        });
+      } else if (canUpgrade && merged.status) {
+        upsertBase.run({
+          external_ref: externalRef,
+          status: merged.status,
+          amount: merged.amount ?? 0,
+          selections: JSON.stringify((ordersStatus.get(externalRef) || {}).selections || {}),
+          cardapios: JSON.stringify((ordersStatus.get(externalRef) || {}).cardapios || null),
+        });
+      }
+    } catch (dbErr) {
+      console.warn('[WEBHOOK][DB WARN]', dbErr?.message || dbErr);
+    }
+
+    console.log(`[ORDERS][UPDATE] ${externalRef} → ${merged.status}`);
+    return res.sendStatus(200);
+  } catch (e) {
+    console.error('[WEBHOOK][ERR]', e?.message || e);
+    return res.sendStatus(200);
+  }
+});
+
 /* -------------------- Retorno (robusto) -------------------- */
 app.get('/retorno', async (req, res) => {
   try {
@@ -465,10 +690,9 @@ app.get('/retorno', async (req, res) => {
 
     if (Array.isArray(externalRef)) externalRef = externalRef[0];
     if (typeof externalRef === 'string' && externalRef.includes(',')) {
-      externalRef = externalRef.split(',')[0].trim(); // mantém o primeiro
+      externalRef = externalRef.split(',')[0].trim();
     }
 
-    // Tenta resolver pelo payment/merchant_order se vierem na URL
     let paymentId =
       req.query.payment_id || req.query.collection_id || req.query['data.id'] || req.query.id || null;
     let merchantOrderId = req.query.merchant_order_id || req.query.merchant_order || null;
@@ -521,25 +745,26 @@ app.get('/retorno', async (req, res) => {
   }
 });
 
-/* -------------------- Webhook TESTE -------------------- */
-app.post('/webhook-test', (req, res) => {
-  console.log('[WH-TEST][HEADERS]', {
-    'content-type': req.headers['content-type'],
-    'x-request-id': req.headers['x-request-id'],
-    'x-signature': req.headers['x-signature'] ? '[present]' : undefined,
-    'user-agent': req.headers['user-agent'],
-  });
-  console.log('[WH-TEST][QUERY]', req.query);
-  console.log('[WH-TEST][BODY]', req.body);
+/* -------------------- Salvar Cardápios -------------------- */
+app.post('/order/save', (req, res) => {
+  const { externalRef, cardapios } = req.body;
+  if (!externalRef || !cardapios) {
+    return res.status(400).json({ error: 'externalRef e cardapios são obrigatórios' });
+  }
 
-  return res.status(200).json({
-    ok: true,
-    seen: {
-      contentType: req.headers['content-type'],
-      query: req.query,
-      body: req.body,
-    },
+  const prev = ordersStatus.get(externalRef) || {};
+  const merged = { ...prev, cardapios };
+  ordersStatus.set(externalRef, merged);
+
+  upsertBase.run({
+    external_ref: externalRef,
+    status: prev.status || 'aguardando',
+    amount: prev.amount || 0,
+    selections: JSON.stringify(prev.selections || {}),
+    cardapios: JSON.stringify(cardapios),
   });
+
+  res.json({ ok: true });
 });
 
 /* ====================== FIM ====================== */
