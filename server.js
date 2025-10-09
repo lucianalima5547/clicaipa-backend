@@ -1,4 +1,4 @@
-// server.js — Clicaipá backend (rotas /order restauradas e sem conflitos)
+// server.js — Clicaipá backend (limpo)
 
 const express = require('express');
 const cors = require('cors');
@@ -7,49 +7,116 @@ const Database = require('better-sqlite3');
 const mp = require('mercadopago');
 const { MercadoPagoConfig, Preference } = mp;
 const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto'); // <- para tokens
 
-// 🔹 Firebase Admin
+// 🔹 Firebase Admin (robusto: aceita várias fontes)
 const admin = require('firebase-admin');
-let serviceAccount;
 
-if (process.env.FIREBASE_CONFIG) {
-  try {
-    serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
-    console.log('[BOOT] Firebase config carregado da variável de ambiente.');
-  } catch (e) {
-    console.error('⛔ FIREBASE_CONFIG inválido:', e.message);
-    process.exit(1);
-  }
-} else {
-  try {
-    serviceAccount = require('./keys/serviceAccountKey.json');
-    console.log('[BOOT] Firebase config carregado do arquivo ./keys/serviceAccountKey.json');
-  } catch (e) {
-    console.error('⛔ Não encontrou serviceAccountKey.json e FIREBASE_CONFIG não definido.');
-    process.exit(1);
-  }
-}
-
-admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-const fdb = admin.firestore();
-const app = express();
-
-/* ======================== ENV & CONFIG ======================== */
+// .env (carrega apenas fora de produção; em produção use env do host)
 if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
 }
 
-const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || 'https://api.clicaipa.com.br').replace(/\/+$/, '');
-const FRONTEND_RESULT_URL = process.env.FRONTEND_RESULT_URL || 'https://app.clicaipa.com.br/#/pospagamento';
-console.log('[BOOT] FRONTEND_RESULT_URL=', FRONTEND_RESULT_URL);
+/* ======================== FIREBASE CREDS ======================== */
+let serviceAccountJson = null;
+
+function loadJsonFromEnvVar(name) {
+  const raw = process.env[name];
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error(`[FIREBASE] ${name} inválido (JSON malformado):`, e.message);
+    return null;
+  }
+}
+
+function loadJsonFromFile(p) {
+  try {
+    const raw = fs.readFileSync(p, 'utf8');
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error(`[FIREBASE] Falha ao ler arquivo ${p}:`, e.message);
+    return null;
+  }
+}
+
+(function resolveFirebaseCredentials() {
+  // 1) Preferência: FIREBASE_CONFIG (JSON inline)
+  serviceAccountJson = loadJsonFromEnvVar('FIREBASE_CONFIG');
+  if (serviceAccountJson) {
+    console.log('[FIREBASE] Usando credenciais de FIREBASE_CONFIG');
+    return;
+  }
+
+  // 2) GOOGLE_APPLICATION_CREDENTIALS → ADC
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    console.log('[FIREBASE] Usando GOOGLE_APPLICATION_CREDENTIALS:', process.env.GOOGLE_APPLICATION_CREDENTIALS);
+    return; // admin.initializeApp() com default credentials logo abaixo
+  }
+
+  // 3) FIREBASE_KEY_PATH → arquivo no disco
+  if (process.env.FIREBASE_KEY_PATH) {
+    const p = process.env.FIREBASE_KEY_PATH;
+    const j = loadJsonFromFile(p);
+    if (j) {
+      serviceAccountJson = j;
+      console.log('[FIREBASE] Usando FIREBASE_KEY_PATH:', p);
+      return;
+    }
+  }
+
+  // 4) Local: ./keys/serviceAccountKey.json
+  const localPath = path.join(__dirname, 'keys', 'serviceAccountKey.json');
+  if (fs.existsSync(localPath)) {
+    const j = loadJsonFromFile(localPath);
+    if (j) {
+      serviceAccountJson = j;
+      console.log('[FIREBASE] Usando ./keys/serviceAccountKey.json');
+      return;
+    }
+  }
+
+  // 5) Alternativa: GOOGLE_SERVICE_ACCOUNT_JSON
+  serviceAccountJson = loadJsonFromEnvVar('GOOGLE_SERVICE_ACCOUNT_JSON');
+  if (serviceAccountJson) {
+    console.log('[FIREBASE] Usando GOOGLE_SERVICE_ACCOUNT_JSON');
+    return;
+  }
+})();
+
+if (serviceAccountJson) {
+  admin.initializeApp({ credential: admin.credential.cert(serviceAccountJson) });
+} else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+  // ADC (Application Default Credentials) — arquivo apontado pela env var
+  admin.initializeApp();
+} else {
+  console.error('⛔ Firebase: nenhuma credencial encontrada. Configure uma das opções:');
+  console.error('   - FIREBASE_CONFIG com JSON da service account (1 linha)');
+  console.error('   - GOOGLE_APPLICATION_CREDENTIALS apontando para o arquivo .json');
+  console.error('   - FIREBASE_KEY_PATH apontando para o arquivo .json');
+  console.error('   - Ou salve ./keys/serviceAccountKey.json');
+  process.exit(1);
+}
+
+const fdb = admin.firestore();
+
+/* ======================== APP ======================== */
+const app = express(); // <<< CRIADO ANTES DE QUALQUER app.use
+
+/* ======================== ENV & CONFIG ======================== */
+const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || 'https://api.clicaipa.com.br').replace(/\/+$/, ''); // backend público (sem barra final)
+const APP_BASE_URL    = String(process.env.APP_BASE_URL    || 'https://app.clicaipa.com.br').replace(/\/+$/, ''); // app frontend (sem barra final)
+
+console.log('[BOOT] NODE_ENV=', process.env.NODE_ENV);
+console.log('[BOOT] PUBLIC_BASE_URL=', PUBLIC_BASE_URL);
+console.log('[BOOT] APP_BASE_URL=', APP_BASE_URL);
 
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || '';
 const tokenFlavor =
   MP_ACCESS_TOKEN.startsWith('APP_USR-') ? 'APP_USR' :
   MP_ACCESS_TOKEN.startsWith('TEST-')    ? 'TEST'    : 'UNKNOWN';
-
-console.log('[BOOT] NODE_ENV=', process.env.NODE_ENV);
-console.log('[BOOT] PUBLIC_BASE_URL=', PUBLIC_BASE_URL);
 console.log(`[BOOT] MP token flavor: ${tokenFlavor} | last6=${MP_ACCESS_TOKEN.slice(-6)}`);
 
 if (!MP_ACCESS_TOKEN) {
@@ -86,30 +153,42 @@ function setOrdersStatus(externalRef, payload) {
 }
 const setOrderStatus = (ref, payload) => setOrdersStatus(ref, payload);
 
-/* ======================== MIDDLEWARES ======================== */
-const allowedOrigins = [
-  /^http:\/\/localhost:\d+$/,
-  'http://localhost',
-  'https://localhost',
-  'https://api.clicaipa.com.br',
-  'https://clicaipa-backend.onrender.com',
-  'https://clicaipa.com.br',
+/* ======================== CORS (ROBUSTO) ======================== */
+const ALLOW_LIST = [
+  /^http:\/\/localhost(?::\d+)?$/,         // localhost qualquer porta
+  /^http:\/\/127\.0\.0\.1(?::\d+)?$/,      // 127.0.0.1 qualquer porta
+  /^https:\/\/.*\.vercel\.app$/,           // previews vercel
   'https://app.clicaipa.com.br',
+  'https://clicaipa.com.br',
+  'https://www.clicaipa.com.br',           // www incluído
+  'https://api.clicaipa.com.br',
 ];
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    if (allowedOrigins.some(p => p instanceof RegExp ? p.test(origin) : p === origin)) {
-      return cb(null, true);
-    }
-    return cb(null, true); // liberar tudo por enquanto
+
+const corsOptions = {
+  origin: function (origin, cb) {
+    if (!origin) return cb(null, true); // permite curl/healthchecks
+    const ok = ALLOW_LIST.some((rule) => rule instanceof RegExp ? rule.test(origin) : rule === origin);
+    if (ok) return cb(null, true);
+    return cb(new Error('Not allowed by CORS: ' + origin), false);
   },
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning'],
+  allowedHeaders: [
+    'Accept',
+    'Content-Type',
+    'Authorization',
+    'Cache-Control',
+    'Pragma',
+    'X-Requested-With',
+    'ngrok-skip-browser-warning',
+  ],
   maxAge: 86400,
-}));
-app.options(/.*/, cors());
+  optionsSuccessStatus: 204,
+};
 
+app.use(cors(corsOptions));
+app.options(/.*/, cors(corsOptions));
+
+/* ======================== BODY PARSERS ======================== */
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -136,15 +215,6 @@ db.exec(`
   );
 `);
 
-try {
-  db.prepare("ALTER TABLE orders ADD COLUMN cardapios TEXT").run();
-  console.log("[BOOT][DB] Coluna 'cardapios' adicionada em orders.");
-} catch (e) {
-  if (!String(e.message).includes("duplicate column name")) {
-    console.error("[BOOT][DB] Erro ao alterar tabela orders:", e.message);
-  }
-}
-
 const upsertBase = db.prepare(`
   INSERT INTO orders (external_ref, status, amount, selections, cardapios, created_at, updated_at)
   VALUES (@external_ref, @status, @amount, @selections, @cardapios, datetime('now'), datetime('now'))
@@ -170,6 +240,95 @@ const upsertPaid = db.prepare(`
     updated_at=datetime('now');
 `);
 
+// --- Secure Link: migração robusta (recria a tabela se necessário) ---
+function ensureSecureLinkColumnsSync(db) {
+  const cols = db.prepare("PRAGMA table_info(orders);").all().map(r => r.name);
+  const needSecureToken  = !cols.includes("secure_token");
+  const needSecureExpiry = !cols.includes("secure_expiry");
+  const needSecureUsed   = !cols.includes("secure_used");
+  const needsRebuild = needSecureToken || needSecureExpiry || needSecureUsed;
+
+  if (!needsRebuild) {
+    try {
+      db.prepare("CREATE INDEX IF NOT EXISTS idx_orders_secure_token ON orders(secure_token)").run();
+    } catch (e) {
+      console.warn("[MIGRATION] Aviso ao criar índice:", e.message);
+    }
+    console.log("[MIGRATION] Secure Link OK — colunas já existem.");
+    return;
+  }
+
+  console.log("[MIGRATION] Reconstruindo tabela orders para adicionar colunas secure_* ...");
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS orders_new (
+        external_ref TEXT PRIMARY KEY,
+        status       TEXT NOT NULL,
+        amount       REAL,
+        merchant_order_id TEXT,
+        payment_id   TEXT,
+        paid_at      TEXT,
+        selections   TEXT,
+        cardapios    TEXT,
+        secure_token  TEXT,
+        secure_expiry INTEGER,
+        secure_used   INTEGER DEFAULT 0,
+        created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+
+    const has = (c) => cols.includes(c);
+    const srcCols = [
+      "external_ref",
+      "status",
+      has("amount")             ? "amount"             : "NULL as amount",
+      has("merchant_order_id")  ? "merchant_order_id"  : "NULL as merchant_order_id",
+      has("payment_id")         ? "payment_id"         : "NULL as payment_id",
+      has("paid_at")            ? "paid_at"            : "NULL as paid_at",
+      has("selections")         ? "selections"         : "NULL as selections",
+      has("cardapios")          ? "cardapios"          : "NULL as cardapios",
+      has("secure_token")       ? "secure_token"       : "NULL as secure_token",
+      has("secure_expiry")      ? "secure_expiry"      : "NULL as secure_expiry",
+      has("secure_used")        ? "secure_used"        : "0 as secure_used",
+      has("created_at")         ? "created_at"         : "datetime('now') as created_at",
+      has("updated_at")         ? "updated_at"         : "datetime('now') as updated_at",
+    ].join(", ");
+
+    db.exec(`
+      INSERT INTO orders_new (
+        external_ref, status, amount, merchant_order_id, payment_id, paid_at,
+        selections, cardapios, secure_token, secure_expiry, secure_used,
+        created_at, updated_at
+      )
+      SELECT ${srcCols} FROM orders;
+    `);
+
+    db.exec(`
+      DROP TABLE orders;
+      ALTER TABLE orders_new RENAME TO orders;
+    `);
+
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_orders_secure_token ON orders(secure_token);
+    `);
+
+    db.exec("COMMIT");
+    console.log("[MIGRATION] Reconstrução concluída com sucesso.");
+  } catch (e) {
+    db.exec("ROLLBACK");
+    console.error("[MIGRATION] Falhou:", e.message);
+    throw e;
+  }
+
+  const finalCols = db.prepare("PRAGMA table_info(orders);").all().map(r => r.name);
+  console.log("[MIGRATION] Colunas finais:", finalCols);
+}
+
+// Chamada da migração no boot
+ensureSecureLinkColumnsSync(db);
+
 /* -------------------- Helpers -------------------- */
 function gerarOrderId() {
   const dt = new Date();
@@ -180,24 +339,6 @@ function gerarOrderId() {
   ].join('');
   const rand = Math.random().toString(36).slice(2, 8).toUpperCase();
   return `PED-${stamp}-${rand}`;
-}
-
-function buildFrontResultUrl(frontBase, externalRef) {
-  if (!frontBase) return null;
-  try {
-    if (frontBase.includes('#')) {
-      const [base, hash] = frontBase.split('#');
-      const [hashPath, hashQuery] = (hash || '').split('?');
-      const qp = new URLSearchParams(hashQuery || '');
-      qp.set('externalRef', externalRef);
-      return `${base}#${hashPath}?${qp.toString()}`;
-    }
-    const u = new URL(frontBase);
-    u.searchParams.set('externalRef', externalRef);
-    return u.toString();
-  } catch {
-    return null;
-  }
 }
 
 /* -------------------- Create Preference -------------------- */
@@ -241,6 +382,8 @@ app.post('/create_preference', async (req, res) => {
         : 24);
 
     const pref = new Preference(mpClient);
+    const retorno = `${PUBLIC_BASE_URL}/retorno`; // base comum das back_urls
+
     const body = {
       items: [{
         title: String(title),
@@ -248,16 +391,28 @@ app.post('/create_preference', async (req, res) => {
         unit_price: price,
         currency_id: 'BRL',
       }],
+
+      // Webhook
       notification_url: `${PUBLIC_BASE_URL}/webhook`,
+
+      // 🔁 back_urls por status — NÃO levam direto à tela resultado
       back_urls: {
-        success: `${PUBLIC_BASE_URL}/retorno?external_ref=${encodeURIComponent(resolvedOrderId)}`,
-        failure: `${PUBLIC_BASE_URL}/retorno?external_ref=${encodeURIComponent(resolvedOrderId)}`,
-        pending: `${PUBLIC_BASE_URL}/retorno?external_ref=${encodeURIComponent(resolvedOrderId)}`,
+        success: `${retorno}?status=approved&external_ref=${encodeURIComponent(resolvedOrderId)}`,
+        pending: `${retorno}?status=pending&external_ref=${encodeURIComponent(resolvedOrderId)}`,
+        failure: `${retorno}?status=failure&external_ref=${encodeURIComponent(resolvedOrderId)}`,
       },
-      auto_return: 'approved',
+      auto_return: 'approved', // auto redireciona apenas quando aprovado
+
       external_reference: resolvedOrderId,
       statement_descriptor: 'CLICAIPA',
       metadata: { source: 'clicaipa-app' },
+
+      // ✅ PIX habilitado (sem excluir métodos)
+      payment_methods: {
+        excluded_payment_methods: [],
+        excluded_payment_types: [],
+        default_payment_method_id: 'pix',
+      },
     };
 
     console.log('[PREFERENCE][CONF][v7]', {
@@ -268,10 +423,18 @@ app.post('/create_preference', async (req, res) => {
 
     const mpRes = await pref.create({ body });
 
-    // ✅ Memória
+    // --- dados úteis do MP ---
+    const preferenceId = mpRes?.id || mpRes?.body?.id || null;
+    const initPoint    = mpRes?.init_point || mpRes?.body?.init_point || null;
+    const sandboxInit  = mpRes?.sandbox_init_point || mpRes?.body?.sandbox_init_point || null;
+    const checkoutUrl  = initPoint || sandboxInit || null;
+
+    // ✅ memória (runtime)
     setOrdersStatus(resolvedOrderId, {
       status: 'aguardando',
       amount: price,
+      preference_id: preferenceId,
+      checkout_url: checkoutUrl,
       selections: {
         proteinasSelecionadas,
         carboidratosSelecionados,
@@ -284,7 +447,7 @@ app.post('/create_preference', async (req, res) => {
       },
     });
 
-    // ✅ SQLite
+    // ✅ persistência (SQLite)
     upsertBase.run({
       external_ref: resolvedOrderId,
       status: 'aguardando',
@@ -302,9 +465,11 @@ app.post('/create_preference', async (req, res) => {
       cardapios: null,
     });
 
-    return res.status(201).json({
-      preference_id: mpRes?.id,
-      init_point: mpRes?.init_point,
+    // ✅ retorno p/ app
+    return res.json({
+      id: preferenceId,
+      init_point: initPoint,
+      sandbox_init_point: sandboxInit,
       external_reference: resolvedOrderId,
     });
   } catch (err) {
@@ -437,70 +602,75 @@ app.post('/webhook', express.json(), async (req, res) => {
   }
 });
 
-/* -------------------- Retorno -------------------- */
+/* -------------------- Retorno validado -------------------- */
 app.get('/retorno', async (req, res) => {
-  try {
-    let externalRef =
-      req.query.external_ref ||
-      req.query.externalRef ||
-      req.query.external_reference ||
-      '';
+  const q = req.query || {};
+  const statusQ = String(q.status || '').toLowerCase();        // approved | pending | failure | ...
+  const externalRef =
+    q.external_ref || q.externalRef || q.external_reference || '';
 
-    if (Array.isArray(externalRef)) externalRef = externalRef[0];
-    if (typeof externalRef === 'string' && externalRef.includes(',')) {
-      externalRef = externalRef.split(',')[0].trim();
-    }
-
-    let paymentId =
-      req.query.payment_id || req.query.collection_id || req.query['data.id'] || req.query.id || null;
-    let merchantOrderId = req.query.merchant_order_id || req.query.merchant_order || null;
-
-    if (!paymentId) {
-      for (const [k, v] of Object.entries(req.query)) {
-        if (/^payment/i.test(k) || /^collection/i.test(k)) { paymentId = String(v); break; }
-      }
-    }
-    if (!merchantOrderId) {
-      for (const [k, v] of Object.entries(req.query)) {
-        if (/merchant.*order/i.test(k)) { merchantOrderId = String(v); break; }
-      }
-    }
-
-    if (!externalRef && paymentId) {
-      try {
-        const pay = await mpGet(`/v1/payments/${String(paymentId).split(',')[0].trim()}`);
-        if (pay?.external_reference) externalRef = String(pay.external_reference);
-      } catch (e) {
-        console.warn('[RETORNO][PAYMENT_LOOKUP][WARN]', e?.message || e);
-      }
-    }
-
-    if (!externalRef && merchantOrderId) {
-      try {
-        const mo = await mpGet(`/merchant_orders/${String(merchantOrderId).split(',')[0].trim()}`);
-        if (mo?.external_reference) {
-          externalRef = String(mo.external_reference);
-        } else if (Array.isArray(mo?.payments) && mo.payments[0]?.id) {
-          const pay = await mpGet(`/v1/payments/${mo.payments[0].id}`);
-          if (pay?.external_reference) externalRef = String(pay.external_reference);
-        }
-      } catch (e) {
-        console.warn('[RETORNO][MO_LOOKUP][WARN]', e?.message || e);
-      }
-    }
-
-    console.log('[RETORNO][DEBUG]', { query: req.query, resolved: { externalRef, paymentId, merchantOrderId } });
-
-    if (!externalRef) return res.status(400).send('externalRef ausente e não foi possível resolver pelos IDs');
-
-    const url = buildFrontResultUrl(FRONTEND_RESULT_URL, externalRef);
-    console.log('[RETORNO][FINAL]', { externalRef, redirect: url });
-    if (url) return res.redirect(url);
-    return res.status(400).send('externalRef inválido');
-  } catch (err) {
-    console.error('[RETORNO][ERR]', err?.message || err);
-    return res.status(500).send('erro no retorno');
+  const ext = String(externalRef || '').trim();
+  if (!ext) {
+    res.status(400).send('<h3>external_ref ausente</h3>');
+    return;
   }
+
+  // informações em memória / banco
+  const mem = ordersStatus.get(ext) || {};
+  const row = db.prepare('SELECT status FROM orders WHERE external_ref = ?').get(ext) || {};
+
+  const statusMem = String(mem.status || '').toLowerCase();
+  const statusDb  = String(row.status || '').toLowerCase();
+
+  // aprovado?
+  const isApproved =
+    statusQ === 'approved' ||
+    statusMem === 'approved' || statusMem === 'pago' || statusMem === 'accredited' || statusMem === 'closed' ||
+    statusDb  === 'approved' || statusDb  === 'pago' || statusDb  === 'accredited' || statusDb  === 'closed';
+
+  // URL para continuar pagamento (se não aprovado)
+  const continueUrl =
+    mem.checkout_url ||
+    (mem.preference_id ? `https://www.mercadopago.com.br/checkout/v1/redirect?pref_id=${mem.preference_id}` : null);
+
+  if (!isApproved) {
+    res.setHeader('Cache-Control', 'no-store');
+    return res.status(200).send(`<!doctype html>
+<html lang="pt-br"><head><meta charset="utf-8"><title>Pagamento não concluído</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial; padding:24px; color:#222;}
+.btn{display:inline-block;padding:10px 14px;background:#0a7;color:#fff;text-decoration:none;border-radius:8px}
+.card{background:#f7f7f7;border-radius:12px;padding:16px;margin-top:12px}
+.small{color:#666;font-size:12px}
+</style></head><body>
+  <h2>Pagamento não concluído</h2>
+  <div class="card">
+    <p>Status atual: <b>${statusQ || 'desconhecido'}</b>.</p>
+    <p>Você pode retornar ao checkout para concluir o pagamento.</p>
+    ${continueUrl ? `<p><a class="btn" href="${continueUrl}">Voltar ao pagamento</a></p>` : `<p class="small">Link de retorno indisponível.</p>`}
+    <p class="small">Ref.: ${ext}</p>
+  </div>
+</body></html>`);
+  }
+
+  // Aprovado → redireciona para a tela Resultado do app
+  const appUrl = `${APP_BASE_URL}/#/resultado?externalRef=${encodeURIComponent(ext)}`;
+  res.setHeader('Cache-Control', 'no-store');
+  return res.redirect(302, appUrl);
+});
+
+/* -------------------- Retorno (legado/hard) -------------------- */
+app.get('/retorno-hard', (req, res) => {
+  const externalRef =
+    req.query.external_ref ||
+    req.query.externalRef ||
+    'PED-TESTE-123';
+
+  const ext = encodeURIComponent(String(externalRef).trim());
+  const url = `https://app.clicaipa.com.br/?externalRef=${ext}#/resultado?externalRef=${ext}`;
+  res.setHeader('Cache-Control', 'no-store');
+  return res.redirect(302, url);
 });
 
 /* -------------------- Salvar/Buscar Cardápios -------------------- */
@@ -544,25 +714,24 @@ app.get('/order/result', (req, res) => {
   return res.status(404).json({ error: 'Cardápios não encontrados' });
 });
 
+// GET /order/continue?externalRef=PED-...
+app.get('/order/continue', (req, res) => {
+  let externalRef = req.query.externalRef || req.query.external_ref || '';
+  externalRef = String(externalRef || '').trim();
+  if (!externalRef) return res.status(400).json({ error: 'externalRef é obrigatório' });
+
+  const mem = ordersStatus.get(externalRef) || {};
+  const checkoutUrl =
+    mem.checkout_url ||
+    (mem.preference_id
+      ? `https://www.mercadopago.com.br/checkout/v1/redirect?pref_id=${mem.preference_id}`
+      : null);
+
+  if (!checkoutUrl) return res.status(404).json({ error: 'continue url indisponível' });
+  return res.json({ externalRef, checkoutUrl });
+});
+
 /* -------------------- Entregar pacote p/ pospagamento -------------------- */
-/**
- * GET /order/selections?externalRef=PED-...
- * Retorna:
- * {
- *   externalRef: "...",
- *   amount: 9.90,
- *   selections: {
- *     proteinasSelecionadas: [...],
- *     carboidratosSelecionados: [...],
- *     legumesSelecionados: [...],
- *     outrosSelecionados: [...],
- *     frescosSelecionados: [...]
- *   },
- *   modo: "congelado" | "semanal",
- *   quantidade: 24 | n,
- *   status: "pending" | "approved" | ...
- * }
- */
 app.get('/order/selections', (req, res) => {
   let externalRef =
     req.query.externalRef ||
@@ -642,9 +811,91 @@ app.get('/orders/:externalRef', (req, res) => {
   return res.redirect(307, `/order/${encodeURIComponent(externalRef)}`);
 });
 
-/* ====================== FIM ====================== */
+/* =================== SECURE LINK: criar token e endpoint oficial =================== */
+
+// validade: 3 dias (em ms)
+const SEC_DAY_MS = 24 * 60 * 60 * 1000;
+const SEC_TTL_MS = 3 * SEC_DAY_MS;
+
+// status considerados "aprovado"
+function isApprovedLike(status) {
+  const s = String(status || '').toLowerCase();
+  return s === 'approved' || s === 'pago' || s === 'accredited' || s === 'closed';
+}
+
+// token aleatório hex
+function makeToken(nBytes = 24) {
+  return crypto.randomBytes(nBytes).toString('hex');
+}
+
+// grava/regrava token para um externalRef
+function createSecureLinkForOrder(extRef) {
+  const token = makeToken(24);
+  const expiry = Date.now() + SEC_TTL_MS;
+
+  const info = db.prepare(`
+    UPDATE orders
+       SET secure_token = @token,
+           secure_expiry = @expiry,
+           secure_used = 0,
+           updated_at = datetime('now')
+     WHERE external_ref = @ext
+  `).run({ token, expiry, ext: extRef });
+
+  if (info.changes === 0) {
+    throw new Error('Pedido não encontrado');
+  }
+  return { token, expiry };
+}
+
+// POST /order/:extRef/secure — cria ou recria o link protegido
+app.post('/order/:extRef/secure', (req, res) => {
+  try {
+    const extRef = String(req.params.extRef || '').trim();
+    if (!extRef) return res.status(400).json({ ok:false, error:'externalRef inválido' });
+
+    const row = db.prepare(`SELECT status FROM orders WHERE external_ref = ?`).get(extRef);
+    if (!row) return res.status(404).json({ ok:false, error:'Pedido não encontrado' });
+
+    if (!isApprovedLike(row.status)) {
+      return res.status(403).json({ ok:false, error:'Pedido ainda não aprovado' });
+    }
+
+    const { token, expiry } = createSecureLinkForOrder(extRef);
+    const protected_url = `${PUBLIC_BASE_URL}/secure/${token}`;
+
+    return res.json({
+      ok: true,
+      external_ref: extRef,
+      token,
+      expires_at: expiry,
+      protected_url
+    });
+  } catch (e) {
+    console.error('[SECURE][CREATE][ERR]', e?.message || e);
+    return res.status(500).json({ ok:false, error:'Falha ao criar link protegido' });
+  }
+});
+
+/* ====================== ERR HANDLERS & START ====================== */
+
+// --- handlers (coloque antes do listen e DEPOIS de todas as rotas válidas) ---
+app.use((err, req, res, next) => {
+  if (err?.message?.startsWith('Not allowed by CORS')) {
+    console.warn('[CORS][BLOCKED]', req.headers.origin);
+    return res.status(403).json({ error: 'CORS blocked', origin: req.headers.origin || null });
+  }
+  console.error('[UNCAUGHT]', err?.stack || err?.message || err);
+  return res.status(500).json({ error: 'internal error' });
+});
+
+// catch-all 404 precisa ser o ÚLTIMO middleware de rota
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`API rodando em http://localhost:${PORT}`);
+
+// --- START: use SEMPRE a porta do Render e 0.0.0.0 ---
+const PORT = Number(process.env.PORT || 10000);
+const HOST = '0.0.0.0';
+
+app.listen(PORT, HOST, () => {
+  console.log(`[BOOT] Server listening on http://${HOST}:${PORT}`);
 });
