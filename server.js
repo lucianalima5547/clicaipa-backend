@@ -877,6 +877,86 @@ app.post('/order/:extRef/secure', (req, res) => {
   }
 });
 
+// =================== SECURE LINK: resolver token e redirecionar ===================
+// GET /secure/:token  → valida token, marca como usado e redireciona para a tela de resultado
+app.get('/secure/:token', (req, res) => {
+  const token = String(req.params.token || '').trim();
+  if (!token) return res.status(400).send('token ausente');
+
+  // Busca o pedido pelo token
+  const row = db.prepare(`
+    SELECT external_ref, secure_expiry, secure_used
+      FROM orders
+     WHERE secure_token = ?
+    LIMIT 1
+  `).get(token);
+
+  if (!row) return res.status(404).send('token inválido');
+
+  const now = Date.now();
+  const expiry = Number(row.secure_expiry || 0);
+  const used = Number(row.secure_used || 0);
+
+  if (expiry && expiry < now) return res.status(410).send('token expirado');
+  if (used > 0)               return res.status(410).send('token já utilizado');
+
+  // marca como utilizado (one-shot)
+  try {
+    db.prepare(`
+      UPDATE orders
+         SET secure_used = 1,
+             updated_at = datetime('now')
+       WHERE secure_token = ?
+    `).run(token);
+  } catch (e) {
+    // não bloqueia o fluxo por falha de update
+    console.warn('[SECURE][MARK_USED][WARN]', e.message);
+  }
+
+  // redireciona para a tela existente do app (usa externalRef)
+  const appUrl = `${APP_BASE_URL}/#/resultado?externalRef=${encodeURIComponent(row.external_ref)}`;
+  res.setHeader('Cache-Control', 'no-store');
+  return res.redirect(302, appUrl);
+});
+// =================== /SECURE LINK =================================================
+
+
+// =================== ADMIN (provisório): atualizar status do pedido ===================
+// Protegido por header X-Admin-Key igual à env ADMIN_KEY
+app.post('/_admin/order/:extRef/status', (req, res) => {
+  const adminKey = process.env.ADMIN_KEY || '';
+  const gotKey = String(req.get('X-Admin-Key') || '');
+  if (!adminKey || gotKey !== adminKey) {
+    return res.status(401).json({ ok:false, error:'unauthorized' });
+  }
+
+  const extRef = String(req.params.extRef || '').trim();
+  const status = String((req.body && req.body.status) || '').trim().toLowerCase();
+  if (!extRef || !status) {
+    return res.status(400).json({ ok:false, error:'extRef e status são obrigatórios' });
+  }
+
+  const valid = new Set(['aguardando','pending','approved','pago','accredited','closed','rejected','cancelled']);
+  if (!valid.has(status)) {
+    return res.status(400).json({ ok:false, error:'status inválido' });
+  }
+
+  const info = db.prepare(`
+    UPDATE orders
+       SET status = @status,
+           updated_at = datetime('now')
+     WHERE external_ref = @extRef
+  `).run({ status, extRef });
+
+  if (info.changes === 0) {
+    return res.status(404).json({ ok:false, error:'Pedido não encontrado' });
+  }
+
+  return res.json({ ok:true, external_ref: extRef, status });
+});
+// =================== /ADMIN ===========================================================
+
+
 /* ====================== ERR HANDLERS & START ====================== */
 
 // --- handlers (coloque antes do listen e DEPOIS de todas as rotas válidas) ---
