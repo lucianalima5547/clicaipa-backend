@@ -660,15 +660,11 @@ app.get('/order/selections', async (req, res) => {
           ? Math.max(1, parseInt(selections?.pessoas, 10) || 1)
           : 24);
 
-    POST https://api.clicaipa.com.br/order/save
-Content-Type: application/json
-
-{
-  "externalRef": "PED-20250920-22h30m-QKHU7U",
-  "cardapios": [
-    { "titulo": "Cardápio de Teste", "receitas": [] }
-  ]
-}
+    // (...) código acima calcula `cardapios`
+    const safeCardapios = Array.isArray(cardapios) && cardapios.length
+  ? cardapios
+  : [{ titulo: 'Cardápio em preparação', receitas: [] }];
+    
     return res.json({
       externalRef,
       amount: amount ?? null,
