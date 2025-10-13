@@ -26,16 +26,14 @@ const pgPool = new Pool({
   ssl: { rejectUnauthorized: false }, // Neon exige SSL
   keepAlive: true,
   max: 10,
-  idleTimeoutMillis: 30000,        // fecha conexões ociosas após 30s
-  connectionTimeoutMillis: 10000,  // timeout de conexão inicial
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
 });
 
-// Evita crash quando o pool encerra cliente ocioso
 pgPool.on('error', (err) => {
   console.error('[PG] Pool idle client error:', err.message);
 });
 
-// Teste rápido de conexão (sem manter client pendurado)
 pgPool
   .query('select 1')
   .then(() => console.log('[PG] conectado com sucesso'))
@@ -64,11 +62,19 @@ async function upsertOrderPg({
   ]);
 }
 
+// Normalizador de status (padrão: approved/pending/rejected)
+function normalizeStatus(s) {
+  const v = String(s || '').toLowerCase();
+  if (['approved', 'pago', 'accredited', 'closed'].includes(v)) return 'approved';
+  if (['pending', 'aguardando', 'in_process', 'in mediation'].includes(v)) return 'pending';
+  if (['rejected', 'cancelled', 'canceled'].includes(v)) return 'rejected';
+  return v || 'pending';
+}
+
 // === Helpers de Link Protegido (PostgreSQL) ===
 const SEC_TTL_HOURS = 24;
 function isApprovedLike(status) {
-  const s = String(status || '').toLowerCase();
-  return s === 'approved' || s === 'pago' || s === 'accredited' || s === 'closed';
+  return ['approved','pago','accredited','closed'].includes(String(status||'').toLowerCase());
 }
 async function createSecureLinkForOrderPg(extRef) {
   const token = crypto.randomBytes(24).toString('hex');
@@ -246,7 +252,7 @@ function mailerOrNull() {
   return nodemailer.createTransport({
     host: SMTP_HOST,
     port: Number(SMTP_PORT),
-    secure: Number(SMTP_PORT) === 465, // 465 => SSL
+    secure: Number(SMTP_PORT) === 465,
     auth: { user: SMTP_USER, pass: SMTP_PASS },
   });
 }
@@ -319,10 +325,10 @@ app.post('/create_preference', async (req, res) => {
     const sandboxInit  = mpRes?.sandbox_init_point || mpRes?.body?.sandbox_init_point || null;
     const checkoutUrl  = initPoint || sandboxInit || null;
 
-    // grava no SQLite já na criação (não depende do webhook)
+    // grava no SQLite já na criação
     upsertBase.run({
       external_ref: resolvedOrderId,
-      status: 'aguardando',           // ✅ produção
+      status: 'aguardando',
       amount: price,
       selections: JSON.stringify({
         proteinasSelecionadas, carboidratosSelecionados, legumesSelecionados,
@@ -332,7 +338,7 @@ app.post('/create_preference', async (req, res) => {
       cardapios: JSON.stringify([]),
     });
 
-    // 👉 também persiste no PostgreSQL (espelha o SQLite)
+    // espelha no PostgreSQL
     try {
       await upsertOrderPg({
         external_ref: resolvedOrderId,
@@ -456,7 +462,7 @@ app.post('/webhook', express.json(), async (req, res) => {
       console.warn('[WEBHOOK][DB WARN]', dbErr?.message || dbErr);
     }
 
-    // 👉 também persiste no PostgreSQL (espelha o SQLite/webhook)
+    // espelha no PostgreSQL
     try {
       await upsertOrderPg({
         external_ref: externalRef,
@@ -512,8 +518,8 @@ app.get('/retorno', async (req, res) => {
   const statusDb  = String(row.status || '').toLowerCase();
   const isApproved =
     statusQ === 'approved' ||
-    statusMem === 'approved' || statusMem === 'pago' || statusMem === 'accredited' || statusMem === 'closed' ||
-    statusDb  === 'approved' || statusDb  === 'pago' || statusDb  === 'accredited' || statusDb  === 'closed';
+    ['approved','pago','accredited','closed'].includes(statusMem) ||
+    ['approved','pago','accredited','closed'].includes(statusDb);
 
   const continueUrl =
     mem.checkout_url ||
@@ -540,7 +546,7 @@ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue'
 </body></html>`);
   }
 
-  // ✅ Blindagem: garanta linha no DB (auto_return timing)
+  // Blindagem
   const exists = db.prepare('SELECT 1 FROM orders WHERE external_ref = ?').get(ext);
   if (!exists) {
     upsertBase.run({
@@ -560,7 +566,7 @@ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue'
   } catch {
     const appUrl = `${APP_BASE_URL}/#/resultado?externalRef=${encodeURIComponent(ext)}`;
     res.setHeader('Cache-Control', 'no-store');
-    return res.redirect(302, appUrl); // fallback
+    return res.redirect(302, appUrl);
   }
 });
 
@@ -584,8 +590,7 @@ app.post('/order/save', (req, res) => {
   return res.json({ ok: true });
 });
 
-// Híbrida: /order/selections lê do PostgreSQL primeiro; fallback para SQLite/memória
-// Híbrida: /order/selections lê do PG; se faltar payload/selections, puxa do SQLite/memória
+// /order/selections — PG primeiro; fallback SQLite/memória
 app.get('/order/selections', async (req, res) => {
   try {
     let externalRef =
@@ -597,7 +602,7 @@ app.get('/order/selections', async (req, res) => {
     externalRef = String(externalRef || '').trim();
     if (!externalRef) return res.status(400).json({ error: 'externalRef é obrigatório' });
 
-    // ===== 1) PG primeiro =====
+    // 1) PG
     let pgRow = null;
     try {
       const r = await pgPool.query(
@@ -612,12 +617,12 @@ app.get('/order/selections', async (req, res) => {
       console.warn('[SELECTIONS][PG] warn:', e.message);
     }
 
-    // dados base vindos do PG (se houver)
+    // base PG
     let status = pgRow?.status || null;
     let amount = pgRow?.amount ?? null;
     let payload = (pgRow && pgRow.payload) ? pgRow.payload : null;
 
-    // ===== 2) Se payload/selections não vieram do PG, tenta memória/SQLite =====
+    // 2) Mem/SQLite
     const mem = ordersStatus.get(externalRef) || {};
     const sqliteRow = db.prepare(
       `SELECT status, amount, selections, cardapios
@@ -630,7 +635,6 @@ app.get('/order/selections', async (req, res) => {
       catch { return null; }
     }
 
-    // selections/cardapios preferindo: PG.payload → memória → SQLite
     const selFromPg  = payload?.selections ? payload.selections : null;
     const selFromMem = parseJSON(mem.selections) || mem.selections || null;
     const selFromSql = parseJSON(sqliteRow?.selections) || null;
@@ -643,13 +647,11 @@ app.get('/order/selections', async (req, res) => {
 
     const cardapios = cardFromPg || cardFromMem || cardFromSql || [];
 
-    // status/amount preferindo PG → memória → SQLite
     if (status == null) status = mem.status || sqliteRow?.status || 'pending';
     if (amount == null) amount = (typeof mem.amount === 'number') ? mem.amount
                       : (typeof sqliteRow?.amount === 'number') ? sqliteRow.amount
                       : null;
 
-    // montar resposta no formato esperado pelo app
     const arr = (x) => Array.isArray(x) ? x : [];
     const modo = (String((selections?.modo ?? 'congelado')).toLowerCase() === 'semanal') ? 'semanal' : 'congelado';
     const quantidade = Number.isFinite(selections?.quantidade)
@@ -670,7 +672,7 @@ app.get('/order/selections', async (req, res) => {
       },
       modo,
       quantidade,
-      status,
+      status: normalizeStatus(status),
       cardapios,
       source: pgRow ? (payload ? 'pg' : 'pg+sqlite') : (sqliteRow ? 'sqlite' : 'mem')
     });
@@ -680,9 +682,7 @@ app.get('/order/selections', async (req, res) => {
   }
 });
 
-
-
-// /order/status — agora lendo do PostgreSQL (tem que vir ANTES de /order/:externalRef)
+// /order/status — lê do PostgreSQL (antes de /order/:externalRef)
 app.get('/order/status', async (req, res) => {
   try {
     const ext =
@@ -711,7 +711,7 @@ app.get('/order/status', async (req, res) => {
     return res.json({
       ok: true,
       external_ref: o.external_ref,
-      status: o.status,
+      status: normalizeStatus(o.status),
       amount: o.amount,
       merchant_order_id: o.merchant_order_id,
       payment_id: o.payment_id,
@@ -724,7 +724,7 @@ app.get('/order/status', async (req, res) => {
   }
 });
 
-// Híbrida: lê do PostgreSQL primeiro; se não achar, tenta SQLite (legado)
+// /order/:externalRef — PG primeiro, fallback SQLite (legado)
 app.get('/order/:externalRef', async (req, res) => {
   const ext = String(req.params.externalRef || '').trim();
   if (!ext) return res.status(400).json({ error: 'externalRef é obrigatório' });
@@ -745,7 +745,7 @@ app.get('/order/:externalRef', async (req, res) => {
       const cardapios  = o.payload?.cardapios  || [];
       return res.json({
         externalRef: o.external_ref,
-        status: o.status,
+        status: normalizeStatus(o.status),
         amount: o.amount,
         selections,
         cardapios,
@@ -762,7 +762,7 @@ app.get('/order/:externalRef', async (req, res) => {
 
     return res.json({
       externalRef: ext,
-      status: row.status,
+      status: normalizeStatus(row.status),
       amount: row.amount,
       selections: row.selections ? JSON.parse(row.selections) : {},
       cardapios: row.cardapios ? JSON.parse(row.cardapios) : [],
@@ -777,34 +777,93 @@ app.get('/order/:externalRef', async (req, res) => {
   }
 });
 
-
 app.get('/orders/:externalRef', (req, res) => {
   const { externalRef } = req.params;
   return res.redirect(307, `/order/${encodeURIComponent(externalRef)}`);
 });
 
-// Criar link protegido (PostgreSQL) — fora de /order/* para não conflitar
+// === PG: status do pedido (rota única, sem duplicatas) ===
+app.get('/pg/status', async (req, res) => {
+  try {
+    const extRaw =
+      req.query.externalRef ||
+      req.query.external_ref ||
+      req.query.ext || '';
+
+    const ext = String(extRaw).trim();
+    if (!ext) return res.status(400).json({ ok: false, error: 'missing externalRef' });
+
+    // 1) exata
+    let r = await pgPool.query(
+      `select external_ref, status, amount, merchant_order_id, payment_id, created_at, updated_at
+         from orders
+        where external_ref = $1
+        limit 1`,
+      [ext]
+    );
+    if (r.rows.length) {
+      const row = r.rows[0];
+      return res.json({ ok: true, ...row, status: normalizeStatus(row.status), match: 'exact' });
+    }
+
+    // 2) TRIM
+    r = await pgPool.query(
+      `select external_ref, status, amount, merchant_order_id, payment_id, created_at, updated_at
+         from orders
+        where trim(external_ref) = trim($1)
+        limit 1`,
+      [ext]
+    );
+    if (r.rows.length) {
+      const row = r.rows[0];
+      return res.json({ ok: true, ...row, status: normalizeStatus(row.status), match: 'trim' });
+    }
+
+    // 3) CONTAINS
+    r = await pgPool.query(
+      `select external_ref, status, amount, merchant_order_id, payment_id, created_at, updated_at
+         from orders
+        where external_ref ilike '%' || $1 || '%'
+        order by created_at desc
+        limit 1`,
+      [ext]
+    );
+    if (r.rows.length) {
+      const row = r.rows[0];
+      return res.json({ ok: true, ...row, status: normalizeStatus(row.status), match: 'contains' });
+    }
+
+    return res.status(404).json({ ok: false, error: 'pedido não encontrado' });
+  } catch (e) {
+    console.error('[PG] /pg/status erro:', e);
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// === PG: gerar link protegido (rota única) ===
 app.get('/pg/protect', async (req, res) => {
   try {
-    const extRef = (req.query?.externalRef || '').toString().trim();
+    const extRef = String(req.query.externalRef || req.query.external_ref || '').trim();
     if (!extRef) return res.status(400).json({ ok:false, error:'externalRef é obrigatório' });
 
-    const o = await pgPool.query(
+    const q = await pgPool.query(
       `select external_ref, status
          from orders
         where external_ref = $1
         limit 1`,
       [extRef]
     );
-    if (!o.rows.length) return res.status(404).json({ ok:false, error:'Pedido não encontrado no PostgreSQL' });
-    if (!isApprovedLike(o.rows[0].status)) return res.status(403).json({ ok:false, error:'Pedido ainda não aprovado' });
+    if (!q.rows.length) return res.status(404).json({ ok:false, error:'Pedido não encontrado no PostgreSQL' });
+
+    if (!isApprovedLike(q.rows[0].status)) return res.status(403).json({ ok:false, error:'Pedido ainda não aprovado' });
 
     const { token, expires_at } = await createSecureLinkForOrderPg(extRef);
-    const protectedUrl = `${req.protocol}://${req.get('host')}/secure_pg/${token}`;
+    const base = (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/,'');
+    const url = `${base}/secure_pg/${token}`;
 
-    return res.json({ ok:true, url: protectedUrl, expiresAt: expires_at });
+    return res.json({ ok:true, url, expiresAt: expires_at });
   } catch (e) {
-    console.error('[PG][protect GET] err:', e?.message || e);
+    console.error('[PG] /pg/protect erro:', e);
     return res.status(500).json({ ok:false, error:'Falha ao criar link protegido (PG)' });
   }
 });
@@ -815,7 +874,6 @@ app.get('/secure_pg/:token', async (req, res) => {
     const token = String(req.params.token || '').trim();
     if (!token) return res.status(400).send('token ausente');
 
-    // valida token no PostgreSQL
     const sel = await pgPool.query(
       `select external_ref, expires_at, used_at
          from secure_links
@@ -829,7 +887,6 @@ app.get('/secure_pg/:token', async (req, res) => {
     if (row.used_at) return res.status(410).send('token já utilizado');
     if (row.expires_at && new Date(row.expires_at) < new Date()) return res.status(410).send('token expirado');
 
-    // marca uso
     await pgPool.query(`update secure_links set used_at = NOW() where token = $1`, [token]);
 
     const appUrl = `${APP_BASE_URL}/#/resultado?externalRef=${encodeURIComponent(row.external_ref)}`;
@@ -895,149 +952,6 @@ app.get('/db/debug_orders', async (_req, res) => {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
-
-// /pg/status — consulta no PostgreSQL sem conflitar com /order/:externalRef
-app.get('/pg/status', async (req, res) => {
-  try {
-    const extRaw =
-      req.query.externalRef ||
-      req.query.external_ref ||
-      req.query.ext ||
-      '';
-
-    const extStr = String(extRaw);
-    if (!extStr) return res.status(400).json({ ok: false, error: 'missing externalRef' });
-
-    // 1) exata
-    let r = await pgPool.query(
-      `select external_ref, status, amount, merchant_order_id, payment_id, created_at, updated_at
-         from orders
-        where external_ref = $1
-        limit 1`,
-      [extStr]
-    );
-    if (r.rows.length) return res.json({ ok: true, ...r.rows[0], match: 'exact' });
-
-    // 2) TRIM
-    r = await pgPool.query(
-      `select external_ref, status, amount, merchant_order_id, payment_id, created_at, updated_at
-         from orders
-        where trim(external_ref) = trim($1)
-        limit 1`,
-      [extStr]
-    );
-    if (r.rows.length) return res.json({ ok: true, ...r.rows[0], match: 'trim' });
-
-    // 3) CONTAINS
-    r = await pgPool.query(
-      `select external_ref, status, amount, merchant_order_id, payment_id, created_at, updated_at
-         from orders
-        where external_ref ilike '%' || $1 || '%'
-        order by created_at desc
-        limit 1`,
-      [extStr]
-    );
-    if (r.rows.length) return res.json({ ok: true, ...r.rows[0], match: 'contains' });
-
-    return res.status(404).json({ ok: false, error: 'pedido não encontrado' });
-  } catch (e) {
-    console.error('[PG] /pg/status erro:', e);
-    return res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-
-// === PG: status do pedido (não conflita com /order/:externalRef) ===
-app.get('/pg/status', async (req, res) => {
-  try {
-    const extRaw =
-      req.query.externalRef ||
-      req.query.external_ref ||
-      req.query.ext || '';
-
-    const ext = String(extRaw).trim();
-    if (!ext) return res.status(400).json({ ok: false, error: 'missing externalRef' });
-
-    // 1) exata
-    let r = await pgPool.query(
-      `select external_ref, status, amount, merchant_order_id, payment_id, created_at, updated_at
-         from orders
-        where external_ref = $1
-        limit 1`,
-      [ext]
-    );
-    if (r.rows.length) return res.json({ ok: true, ...r.rows[0], match: 'exact' });
-
-    // 2) TRIM
-    r = await pgPool.query(
-      `select external_ref, status, amount, merchant_order_id, payment_id, created_at, updated_at
-         from orders
-        where trim(external_ref) = trim($1)
-        limit 1`,
-      [ext]
-    );
-    if (r.rows.length) return res.json({ ok: true, ...r.rows[0], match: 'trim' });
-
-    // 3) CONTAINS (fallback)
-    r = await pgPool.query(
-      `select external_ref, status, amount, merchant_order_id, payment_id, created_at, updated_at
-         from orders
-        where external_ref ilike '%' || $1 || '%'
-        order by created_at desc
-        limit 1`,
-      [ext]
-    );
-    if (r.rows.length) return res.json({ ok: true, ...r.rows[0], match: 'contains' });
-
-    return res.status(404).json({ ok: false, error: 'pedido não encontrado' });
-  } catch (e) {
-    console.error('[PG] /pg/status erro:', e);
-    return res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-// === PG: gerar link protegido ===
-app.get('/pg/protect', async (req, res) => {
-  try {
-    const extRef = String(req.query.externalRef || req.query.external_ref || '').trim();
-    if (!extRef) return res.status(400).json({ ok:false, error:'externalRef é obrigatório' });
-
-    // precisa existir e estar aprovado/pago
-    const q = await pgPool.query(
-      `select external_ref, status
-         from orders
-        where external_ref = $1
-        limit 1`,
-      [extRef]
-    );
-    if (!q.rows.length) return res.status(404).json({ ok:false, error:'Pedido não encontrado no PostgreSQL' });
-
-    const s = String(q.rows[0].status || '').toLowerCase();
-    const approved = ['approved','pago','accredited','closed'].includes(s);
-    if (!approved) return res.status(403).json({ ok:false, error:'Pedido ainda não aprovado' });
-
-    // cria token na secure_links
-    const token = require('crypto').randomBytes(24).toString('hex');
-    const expiresAt = new Date(Date.now() + 24*60*60*1000); // +24h
-    await pgPool.query(
-      `insert into secure_links (token, external_ref, expires_at) values ($1,$2,$3)
-       on conflict (token) do nothing`,
-      [token, extRef, expiresAt]
-    );
-
-    // monta URL pública (em produção use o domínio público)
-    const base =
-      process.env.PUBLIC_BASE_URL ||
-      `${req.protocol}://${req.get('host')}`;
-    const url = `${base.replace(/\/+$/,'')}/secure_pg/${token}`;
-
-    return res.json({ ok:true, url, expiresAt });
-  } catch (e) {
-    console.error('[PG] /pg/protect erro:', e);
-    return res.status(500).json({ ok:false, error:'Falha ao criar link protegido (PG)' });
-  }
-});
-
 
 /* ======================== LISTEN ======================== */
 const PORT = Number(process.env.PORT || 8080);
