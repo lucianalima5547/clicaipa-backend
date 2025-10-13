@@ -584,44 +584,103 @@ app.post('/order/save', (req, res) => {
   return res.json({ ok: true });
 });
 
-app.get('/order/selections', (req, res) => {
-  let externalRef = req.query.externalRef || req.query.external_ref || req.query.external_reference || '';
-  if (Array.isArray(externalRef)) externalRef = externalRef[0];
-  externalRef = String(externalRef || '').trim();
-  if (!externalRef) return res.status(400).json({ error: 'externalRef é obrigatório' });
+// Híbrida: /order/selections lê do PostgreSQL primeiro; fallback para SQLite/memória
+// Híbrida: /order/selections lê do PG; se faltar payload/selections, puxa do SQLite/memória
+app.get('/order/selections', async (req, res) => {
+  try {
+    let externalRef =
+      req.query.externalRef ||
+      req.query.external_ref ||
+      req.query.external_reference || '';
 
-  const mem = ordersStatus.get(externalRef);
-  const row = db.prepare(`SELECT status, amount, selections FROM orders WHERE external_ref = ?`).get(externalRef);
+    if (Array.isArray(externalRef)) externalRef = externalRef[0];
+    externalRef = String(externalRef || '').trim();
+    if (!externalRef) return res.status(400).json({ error: 'externalRef é obrigatório' });
 
-  function parseSelections(raw) { try { return raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : null; } catch { return null; } }
+    // ===== 1) PG primeiro =====
+    let pgRow = null;
+    try {
+      const r = await pgPool.query(
+        `select external_ref, status, amount, payload
+           from orders
+          where external_ref = $1
+          limit 1`,
+        [externalRef]
+      );
+      if (r.rows.length) pgRow = r.rows[0];
+    } catch (e) {
+      console.warn('[SELECTIONS][PG] warn:', e.message);
+    }
 
-  const selMem = parseSelections(mem?.selections) || mem?.selections || null;
-  const selDb  = parseSelections(row?.selections) || null;
-  const selections = selMem || selDb || {};
+    // dados base vindos do PG (se houver)
+    let status = pgRow?.status || null;
+    let amount = pgRow?.amount ?? null;
+    let payload = (pgRow && pgRow.payload) ? pgRow.payload : null;
 
-  const amount = (typeof mem?.amount === 'number') ? mem.amount : (typeof row?.amount === 'number') ? row.amount : null;
-  const status = mem?.status || row?.status || 'pending';
+    // ===== 2) Se payload/selections não vieram do PG, tenta memória/SQLite =====
+    const mem = ordersStatus.get(externalRef) || {};
+    const sqliteRow = db.prepare(
+      `SELECT status, amount, selections, cardapios
+         FROM orders
+        WHERE external_ref = ?`
+    ).get(externalRef) || null;
 
-  const modo = (String(selections?.modo || 'congelado').toLowerCase() === 'semanal') ? 'semanal' : 'congelado';
-  const quantidade = Number.isFinite(selections?.quantidade)
-    ? Number(selections.quantidade)
-    : (modo === 'semanal' ? Math.max(1, parseInt(selections?.pessoas, 10) || 1) : 24);
+    function parseJSON(raw) {
+      try { return raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : null; }
+      catch { return null; }
+    }
 
-  const arr = (x) => Array.isArray(x) ? x : [];
+    // selections/cardapios preferindo: PG.payload → memória → SQLite
+    const selFromPg  = payload?.selections ? payload.selections : null;
+    const selFromMem = parseJSON(mem.selections) || mem.selections || null;
+    const selFromSql = parseJSON(sqliteRow?.selections) || null;
 
-  return res.json({
-    externalRef,
-    amount: amount ?? null,
-    selections: {
-      proteinasSelecionadas:    arr(selections?.proteinasSelecionadas),
-      carboidratosSelecionados: arr(selections?.carboidratosSelecionados),
-      legumesSelecionados:      arr(selections?.legumesSelecionados),
-      outrosSelecionados:       arr(selections?.outrosSelecionados),
-      frescosSelecionados:      arr(selections?.frescosSelecionados),
-    },
-    modo, quantidade, status,
-  });
+    const selections = selFromPg || selFromMem || selFromSql || {};
+
+    const cardFromPg  = payload?.cardapios ? payload.cardapios : null;
+    const cardFromMem = mem.cardapios || null;
+    const cardFromSql = parseJSON(sqliteRow?.cardapios) || null;
+
+    const cardapios = cardFromPg || cardFromMem || cardFromSql || [];
+
+    // status/amount preferindo PG → memória → SQLite
+    if (status == null) status = mem.status || sqliteRow?.status || 'pending';
+    if (amount == null) amount = (typeof mem.amount === 'number') ? mem.amount
+                      : (typeof sqliteRow?.amount === 'number') ? sqliteRow.amount
+                      : null;
+
+    // montar resposta no formato esperado pelo app
+    const arr = (x) => Array.isArray(x) ? x : [];
+    const modo = (String((selections?.modo ?? 'congelado')).toLowerCase() === 'semanal') ? 'semanal' : 'congelado';
+    const quantidade = Number.isFinite(selections?.quantidade)
+      ? Number(selections.quantidade)
+      : (modo === 'semanal'
+          ? Math.max(1, parseInt(selections?.pessoas, 10) || 1)
+          : 24);
+
+    return res.json({
+      externalRef,
+      amount: amount ?? null,
+      selections: {
+        proteinasSelecionadas:    arr(selections?.proteinasSelecionadas),
+        carboidratosSelecionados: arr(selections?.carboidratosSelecionados),
+        legumesSelecionados:      arr(selections?.legumesSelecionados),
+        outrosSelecionados:       arr(selections?.outrosSelecionados),
+        frescosSelecionados:      arr(selections?.frescosSelecionados),
+      },
+      modo,
+      quantidade,
+      status,
+      cardapios,
+      source: pgRow ? (payload ? 'pg' : 'pg+sqlite') : (sqliteRow ? 'sqlite' : 'mem')
+    });
+  } catch (e) {
+    console.error('[ORDER/SELECTIONS][ERR]', e?.message || e);
+    return res.status(500).json({ error: 'erro interno' });
+  }
 });
+
+
 
 // /order/status — agora lendo do PostgreSQL (tem que vir ANTES de /order/:externalRef)
 app.get('/order/status', async (req, res) => {
@@ -665,20 +724,60 @@ app.get('/order/status', async (req, res) => {
   }
 });
 
-app.get('/order/:externalRef', (req, res) => {
-  const row = db.prepare('SELECT * FROM orders WHERE external_ref = ?').get(req.params.externalRef);
-  if (!row) return res.status(404).json({ error: 'pedido não encontrado' });
-  res.json({
-    externalRef: req.params.externalRef,
-    status: row.status,
-    amount: row.amount,
-    selections: row.selections ? JSON.parse(row.selections) : {},
-    cardapios: row.cardapios ? JSON.parse(row.cardapios) : [],
-    updated_at: row.updated_at,
-    payment_id: row.payment_id,
-    merchant_order_id: row.merchant_order_id,
-  });
+// Híbrida: lê do PostgreSQL primeiro; se não achar, tenta SQLite (legado)
+app.get('/order/:externalRef', async (req, res) => {
+  const ext = String(req.params.externalRef || '').trim();
+  if (!ext) return res.status(400).json({ error: 'externalRef é obrigatório' });
+
+  try {
+    // 1) Postgres
+    const r = await pgPool.query(
+      `select external_ref, status, amount, merchant_order_id, payment_id, created_at, updated_at, payload
+         from orders
+        where external_ref = $1
+        limit 1`,
+      [ext]
+    );
+
+    if (r.rows.length) {
+      const o = r.rows[0];
+      const selections = o.payload?.selections || {};
+      const cardapios  = o.payload?.cardapios  || [];
+      return res.json({
+        externalRef: o.external_ref,
+        status: o.status,
+        amount: o.amount,
+        selections,
+        cardapios,
+        updated_at: o.updated_at,
+        payment_id: o.payment_id,
+        merchant_order_id: o.merchant_order_id,
+        source: 'pg'
+      });
+    }
+
+    // 2) Fallback: SQLite (legado)
+    const row = db.prepare('SELECT * FROM orders WHERE external_ref = ?').get(ext);
+    if (!row) return res.status(404).json({ error: 'pedido não encontrado' });
+
+    return res.json({
+      externalRef: ext,
+      status: row.status,
+      amount: row.amount,
+      selections: row.selections ? JSON.parse(row.selections) : {},
+      cardapios: row.cardapios ? JSON.parse(row.cardapios) : [],
+      updated_at: row.updated_at,
+      payment_id: row.payment_id,
+      merchant_order_id: row.merchant_order_id,
+      source: 'sqlite'
+    });
+  } catch (e) {
+    console.error('[ORDER BY EXT][ERR]', e?.message || e);
+    return res.status(500).json({ error: 'erro interno' });
+  }
 });
+
+
 app.get('/orders/:externalRef', (req, res) => {
   const { externalRef } = req.params;
   return res.redirect(307, `/order/${encodeURIComponent(externalRef)}`);
