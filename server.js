@@ -71,22 +71,92 @@ function normalizeStatus(s) {
   return v || 'pending';
 }
 
-// === Helpers de Link Protegido (PostgreSQL) ===
-const SEC_TTL_HOURS = 24;
-function isApprovedLike(status) {
-  return ['approved','pago','accredited','closed'].includes(String(status||'').toLowerCase());
+// === Helpers de Link Protegido (PostgreSQL) — UNIFICADO ===
+const pool = pgPool; // reaproveita pool criado acima
+
+async function ensureSecureLinksTableUnified() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS secure_links (
+      token        TEXT PRIMARY KEY,
+      external_ref TEXT NOT NULL,
+      expires_at   TIMESTAMPTZ NOT NULL,
+      used_at      TIMESTAMPTZ NULL,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_secure_links_extref
+      ON secure_links (external_ref, expires_at DESC);
+  `);
 }
-async function createSecureLinkForOrderPg(extRef) {
-  const token = crypto.randomBytes(24).toString('hex');
-  const sql = `
-    INSERT INTO secure_links (external_ref, token, expires_at, used_at)
-    VALUES ($1, $2, NOW() + INTERVAL '${SEC_TTL_HOURS} hours', NULL)
-    ON CONFLICT (token) DO UPDATE
-      SET expires_at = EXCLUDED.expires_at, used_at = NULL
-    RETURNING token, expires_at
-  `;
-  const { rows } = await pgPool.query(sql, [extRef, token]);
-  return { token: rows[0].token, expires_at: rows[0].expires_at };
+ensureSecureLinksTableUnified()
+  .then(() => console.log('[MIGRATION] secure_links OK (unified)'))
+  .catch(err => console.error('[MIGRATION] secure_links FAIL', err?.message || err));
+
+function makeUrlSafeToken() {
+  return crypto.randomBytes(24).toString('base64url'); // seguro p/ URL
+}
+function appUrlForToken(token) {
+  const base = process.env.APP_BASE_URL || 'https://app.clicaipa.com.br';
+  return `${base}/#/resultado?token=${token}`;
+}
+function secureUrlForToken(token) {
+  const base = (process.env.PUBLIC_BASE_URL || 'https://api.clicaipa.com.br').replace(/\/+$/,'');
+  return `${base}/secure/${token}`;
+}
+async function getPgOrder(externalRef) {
+  const r = await pool.query(
+    `SELECT external_ref, status, amount, merchant_order_id, payment_id
+       FROM orders
+      WHERE external_ref = $1
+      LIMIT 1`,
+    [externalRef]
+  );
+  return r.rows[0] || null;
+}
+function isPaidLike(status) {
+  const s = String(status || '').toLowerCase();
+  return s === 'approved' || s === 'pago' || s === 'paid' || s === 'accredited' || s === 'closed';
+}
+async function createOrReuseSecureLinkForOrderPgUnified(externalRef) {
+  // Tenta reusar token válido (não expirado, não usado)
+  const reuse = await pool.query(
+    `SELECT token, expires_at
+       FROM secure_links
+      WHERE external_ref = $1
+        AND expires_at > NOW()
+        AND (used_at IS NULL)
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [externalRef]
+  );
+  if (reuse.rows[0]) {
+    const { token, expires_at } = reuse.rows[0];
+    return {
+      ok: true,
+      token,
+      secureUrl: secureUrlForToken(token),
+      appUrl: appUrlForToken(token),
+      expiresAt: new Date(expires_at).toISOString(),
+      reused: true
+    };
+  }
+
+  const token = makeUrlSafeToken();
+  await pool.query(
+    `INSERT INTO secure_links (token, external_ref, expires_at)
+     VALUES ($1, $2, NOW() + INTERVAL '24 HOURS')`,
+    [token, externalRef]
+  );
+  const ex = await pool.query(`SELECT expires_at FROM secure_links WHERE token = $1`, [token]);
+  const expiresAt = ex.rows[0].expires_at;
+
+  return {
+    ok: true,
+    token,
+    secureUrl: secureUrlForToken(token),
+    appUrl: appUrlForToken(token),
+    expiresAt: new Date(expiresAt).toISOString(),
+    reused: false
+  };
 }
 
 /* ======================== FIREBASE CREDS ======================== */
@@ -191,7 +261,7 @@ app.get('/ping', (_req, res) => res.json({ ok: true, time: new Date().toISOStrin
 app.get('/', (_req, res) => res.send('OK – Clicaipá backend no ar'));
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
-/* ======================== SQLite ======================== */
+/* ======================== SQLite (LEGADO / COMPAT) ======================== */
 const db = new Database(path.join(__dirname, 'data.sqlite'));
 db.pragma('journal_mode = WAL');
 db.exec(`
@@ -325,7 +395,7 @@ app.post('/create_preference', async (req, res) => {
     const sandboxInit  = mpRes?.sandbox_init_point || mpRes?.body?.sandbox_init_point || null;
     const checkoutUrl  = initPoint || sandboxInit || null;
 
-    // grava no SQLite já na criação
+    // grava no SQLite já na criação (compat)
     upsertBase.run({
       external_ref: resolvedOrderId,
       status: 'aguardando',
@@ -484,25 +554,6 @@ app.post('/webhook', express.json(), async (req, res) => {
   }
 });
 
-/* ======================== Secure Link helpers (SQLite) ======================== */
-const SEC_DAY_MS = 24 * 60 * 60 * 1000;
-const SEC_TTL_MS = 1 * SEC_DAY_MS; // 24h
-function makeToken(nBytes = 24) { return crypto.randomBytes(nBytes).toString('hex'); }
-function createSecureLinkForOrder(extRef) {
-  const token = makeToken(24);
-  const expiry = Date.now() + SEC_TTL_MS;
-  const info = db.prepare(`
-    UPDATE orders
-       SET secure_token = @token,
-           secure_expiry = @expiry,
-           secure_used = 0,
-           updated_at = datetime('now')
-     WHERE external_ref = @ext
-  `).run({ token, expiry, ext: extRef });
-  if (info.changes === 0) throw new Error('Pedido não encontrado');
-  return { token, expiry };
-}
-
 /* ======================== /retorno (MP → aprovado) ======================== */
 app.get('/retorno', async (req, res) => {
   const q = req.query || {};
@@ -511,6 +562,7 @@ app.get('/retorno', async (req, res) => {
   const ext = String(externalRef || '').trim();
   if (!ext) return res.status(400).send('<h3>external_ref ausente</h3>');
 
+  // checa status confirmado (mem/sqlite) apenas para mensagem amigável
   const mem = ordersStatus.get(ext) || {};
   const row = db.prepare('SELECT status FROM orders WHERE external_ref = ?').get(ext) || {};
 
@@ -521,11 +573,11 @@ app.get('/retorno', async (req, res) => {
     ['approved','pago','accredited','closed'].includes(statusMem) ||
     ['approved','pago','accredited','closed'].includes(statusDb);
 
-  const continueUrl =
-    mem.checkout_url ||
-    (mem.preference_id ? `https://www.mercadopago.com.br/checkout/v1/redirect?pref_id=${mem.preference_id}` : null);
-
   if (!isApproved) {
+    const continueUrl =
+      mem.checkout_url ||
+      (mem.preference_id ? `https://www.mercadopago.com.br/checkout/v1/redirect?pref_id=${mem.preference_id}` : null);
+
     res.setHeader('Cache-Control', 'no-store');
     return res.status(200).send(`<!doctype html>
 <html lang="pt-br"><head><meta charset="utf-8"><title>Pagamento não concluído</title>
@@ -546,24 +598,14 @@ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue'
 </body></html>`);
   }
 
-  // Blindagem
-  const exists = db.prepare('SELECT 1 FROM orders WHERE external_ref = ?').get(ext);
-  if (!exists) {
-    upsertBase.run({
-      external_ref: ext,
-      status: mem.status || 'aguardando',
-      amount: mem.amount || 0,
-      selections: JSON.stringify(mem.selections || {}),
-      cardapios: JSON.stringify(mem.cardapios || []),
-    });
-  }
-
+  // Gera/usa token PROTEGIDO no Postgres (unificado)
   try {
-    const { token: secureToken } = createSecureLinkForOrder(ext);
-    const secureUrl = `${PUBLIC_BASE_URL}/secure/${secureToken}`;
+    const out = await createOrReuseSecureLinkForOrderPgUnified(ext);
+    const secureUrl = out.secureUrl; // PUBLIC_BASE_URL/secure/:token
     res.setHeader('Cache-Control', 'no-store');
     return res.redirect(302, secureUrl);
-  } catch {
+  } catch (e) {
+    console.error('[RETORNO] falha ao criar token PG, fallback para app com externalRef', e?.message || e);
     const appUrl = `${APP_BASE_URL}/#/resultado?externalRef=${encodeURIComponent(ext)}`;
     res.setHeader('Cache-Control', 'no-store');
     return res.redirect(302, appUrl);
@@ -645,7 +687,10 @@ app.get('/order/selections', async (req, res) => {
     const cardFromMem = mem.cardapios || null;
     const cardFromSql = parseJSON(sqliteRow?.cardapios) || null;
 
-    const cardapios = cardFromPg || cardFromMem || cardFromSql || [];
+    const cardapiosRaw = cardFromPg || cardFromMem || cardFromSql || [];
+    const safeCardapios = Array.isArray(cardapiosRaw) && cardapiosRaw.length
+      ? cardapiosRaw
+      : [{ titulo: 'Cardápio em preparação', receitas: [] }];
 
     if (status == null) status = mem.status || sqliteRow?.status || 'pending';
     if (amount == null) amount = (typeof mem.amount === 'number') ? mem.amount
@@ -660,11 +705,6 @@ app.get('/order/selections', async (req, res) => {
           ? Math.max(1, parseInt(selections?.pessoas, 10) || 1)
           : 24);
 
-    // (...) código acima calcula `cardapios`
-    const safeCardapios = Array.isArray(cardapios) && cardapios.length
-  ? cardapios
-  : [{ titulo: 'Cardápio em preparação', receitas: [] }];
-    
     return res.json({
       externalRef,
       amount: amount ?? null,
@@ -678,7 +718,7 @@ app.get('/order/selections', async (req, res) => {
       modo,
       quantidade,
       status: normalizeStatus(status),
-      cardapios,
+      cardapios: safeCardapios,
       source: pgRow ? (payload ? 'pg' : 'pg+sqlite') : (sqliteRow ? 'sqlite' : 'mem')
     });
   } catch (e) {
@@ -845,35 +885,26 @@ app.get('/pg/status', async (req, res) => {
   }
 });
 
-// === PG: gerar link protegido (rota única) ===
+// === PG: gerar link protegido (GET auxiliar) ===
+// Mantido para compat: usa o bloco unificado
 app.get('/pg/protect', async (req, res) => {
   try {
     const extRef = String(req.query.externalRef || req.query.external_ref || '').trim();
     if (!extRef) return res.status(400).json({ ok:false, error:'externalRef é obrigatório' });
 
-    const q = await pgPool.query(
-      `select external_ref, status
-         from orders
-        where external_ref = $1
-        limit 1`,
-      [extRef]
-    );
-    if (!q.rows.length) return res.status(404).json({ ok:false, error:'Pedido não encontrado no PostgreSQL' });
+    const ord = await getPgOrder(extRef);
+    if (!ord) return res.status(404).json({ ok:false, error:'Pedido não encontrado no PostgreSQL' });
+    if (!isPaidLike(ord.status)) return res.status(403).json({ ok:false, error:'Pedido ainda não aprovado' });
 
-    if (!isApprovedLike(q.rows[0].status)) return res.status(403).json({ ok:false, error:'Pedido ainda não aprovado' });
-
-    const { token, expires_at } = await createSecureLinkForOrderPg(extRef);
-    const base = (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/,'');
-    const url = `${base}/secure_pg/${token}`;
-
-    return res.json({ ok:true, url, expiresAt: expires_at });
+    const out = await createOrReuseSecureLinkForOrderPgUnified(extRef);
+    return res.json(out);
   } catch (e) {
     console.error('[PG] /pg/protect erro:', e);
     return res.status(500).json({ ok:false, error:'Falha ao criar link protegido (PG)' });
   }
 });
 
-// === Consumir token protegido (PG) ===
+// === Consumir token protegido (PG) — redireciona com ?token=...
 app.get('/secure_pg/:token', async (req, res) => {
   try {
     const token = String(req.params.token || '').trim();
@@ -889,12 +920,12 @@ app.get('/secure_pg/:token', async (req, res) => {
     if (!sel.rows.length) return res.status(404).send('token inválido');
 
     const row = sel.rows[0];
-    if (row.used_at) return res.status(410).send('token já utilizado');
     if (row.expires_at && new Date(row.expires_at) < new Date()) return res.status(410).send('token expirado');
 
-    await pgPool.query(`update secure_links set used_at = NOW() where token = $1`, [token]);
+    // Se quiser consumo único, descomente:
+    // await pgPool.query(`update secure_links set used_at = NOW() where token = $1`, [token]);
 
-    const appUrl = `${APP_BASE_URL}/#/resultado?externalRef=${encodeURIComponent(row.external_ref)}`;
+    const appUrl = `${APP_BASE_URL}/#/resultado?token=${encodeURIComponent(token)}`;
     res.setHeader('Cache-Control', 'no-store');
     return res.redirect(302, appUrl);
   } catch (e) {
@@ -903,58 +934,81 @@ app.get('/secure_pg/:token', async (req, res) => {
   }
 });
 
-app.get('/db/ping', async (_req, res) => {
+// ================== ROTAS OFICIAIS DE LINK PROTEGIDO ==================
+
+// POST /order/protect → cria/reusa token para pedido pago (PG)
+app.post('/order/protect', async (req, res) => {
   try {
-    const r = await pgPool.query('select current_database() as db, now() as ts');
-    res.json({ ok: true, db: r.rows[0].db, ts: r.rows[0].ts });
-  } catch (e) {
-    console.error('[PG] ping erro:', e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+    const externalRef = String(req.body?.externalRef || '').trim();
+    if (!externalRef) return res.status(400).json({ ok:false, error:'externalRef obrigatório' });
+
+    const ord = await getPgOrder(externalRef);
+    if (!ord) return res.status(404).json({ ok:false, error:'pedido não encontrado' });
+    if (!isPaidLike(ord.status)) return res.status(409).json({ ok:false, error:'pedido não está pago' });
+
+    const out = await createOrReuseSecureLinkForOrderPgUnified(externalRef);
+    return res.json(out);
+  } catch (err) {
+    console.error('[POST /order/protect] erro', err?.message || err);
+    return res.status(500).json({ ok:false, error:'falha interna' });
   }
 });
 
-// Rota temporária para inspecionar pedido no Postgres por external_ref
-app.get('/pg/order/:ext', async (req, res) => {
+// GET /secure/:token → valida e redireciona para o app com ?token=...
+app.get('/secure/:token', async (req, res) => {
   try {
-    const { ext } = req.params;
-    const { rows } = await pgPool.query(
-      `select external_ref, status, amount, merchant_order_id, payment_id, created_at, updated_at
-         from orders
-        where external_ref = $1`,
-      [ext]
+    const token = String(req.params.token || '').trim();
+    if (!token) return res.status(400).send('token inválido');
+
+    const r = await pool.query(
+      `SELECT token, expires_at, used_at
+         FROM secure_links
+        WHERE token = $1
+        LIMIT 1`,
+      [token]
     );
-    if (rows.length === 0) return res.status(404).json({ ok: false, error: 'not found' });
-    res.json({ ok: true, order: rows[0] });
-  } catch (e) {
-    console.error('[PG] /pg/order erro:', e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+    const row = r.rows[0];
+    if (!row) return res.status(404).send('token não encontrado');
+    if (row.expires_at && new Date(row.expires_at) <= new Date()) return res.status(410).send('token expirado');
+
+    // (opcional) consumo único:
+    // await pool.query(`UPDATE secure_links SET used_at = NOW() WHERE token = $1`, [token]);
+
+    res.setHeader('Cache-Control', 'no-store');
+    return res.redirect(302, appUrlForToken(token));
+  } catch (err) {
+    console.error('[GET /secure/:token] erro', err?.message || err);
+    return res.status(500).send('erro interno');
   }
 });
 
-// DEBUG: ver em qual DB estamos e exemplos da tabela orders
-app.get('/db/debug_orders', async (_req, res) => {
+// (Opcional) GET /order/secure/:token → payload mínimo para o app
+app.get('/order/secure/:token', async (req, res) => {
   try {
-    const meta = await pgPool.query(
-      `select current_database() as db, current_user as usr, inet_server_addr()::text as host`
+    const token = String(req.params.token || '').trim();
+    if (!token) return res.status(400).json({ ok:false, error:'token inválido' });
+
+    const r = await pool.query(
+      `SELECT external_ref, expires_at, used_at
+         FROM secure_links
+        WHERE token = $1
+        LIMIT 1`,
+      [token]
     );
-    const cnt = await pgPool.query(`select count(*)::int as n from orders`);
-    const sample = await pgPool.query(
-      `select external_ref, status, created_at
-         from orders
-        order by created_at desc
-        limit 5`
-    );
-    res.json({
+    const row = r.rows[0];
+    if (!row) return res.status(404).json({ ok:false, error:'token não encontrado' });
+    if (row.expires_at && new Date(row.expires_at) <= new Date()) return res.status(410).json({ ok:false, error:'token expirado' });
+
+    return res.json({
       ok: true,
-      db: meta.rows[0].db,
-      user: meta.rows[0].usr,
-      host: meta.rows[0].host,
-      orders_count: cnt.rows[0].n,
-      sample: sample.rows
+      token,
+      externalRef: row.external_ref,
+      appUrl: appUrlForToken(token),
+      expiresAt: new Date(row.expires_at).toISOString()
     });
-  } catch (e) {
-    console.error('[PG] /db/debug_orders erro:', e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+  } catch (err) {
+    console.error('[GET /order/secure/:token] erro', err?.message || err);
+    return res.status(500).json({ ok:false, error:'erro interno' });
   }
 });
 
