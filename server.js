@@ -729,17 +729,36 @@ app.get('/order/selections', async (req, res) => {
   }
 });
 
-// /order/status — lê do PostgreSQL (antes de /order/:externalRef)
+// /order/status — agora aceita ?token=... (resolve para external_ref via secure_links)
 app.get('/order/status', async (req, res) => {
   try {
-    const ext =
+    // 1) tenta pegar externalRef direto
+    let ext =
       req.query.externalRef ||
       req.query.external_ref ||
       req.query.ext ||
       '';
 
+    // 2) se não veio, tenta resolver via token (secure_links)
+    if (!ext && req.query.token) {
+      try {
+        const t = String(req.query.token).trim();
+        const rTok = await pgPool.query(
+          `select external_ref
+             from secure_links
+            where token = $1
+              and (expires_at is null or expires_at > now())
+            limit 1`,
+          [t]
+        );
+        if (rTok.rows.length) ext = rTok.rows[0].external_ref;
+      } catch (e) {
+        console.warn('[PG] /order/status token->ext warn:', e.message);
+      }
+    }
+
     if (!ext) {
-      return res.status(400).json({ ok: false, error: 'missing externalRef' });
+      return res.status(400).json({ ok: false, error: 'missing externalRef or token' });
     }
 
     const { rows } = await pgPool.query(
@@ -758,7 +777,7 @@ app.get('/order/status', async (req, res) => {
     return res.json({
       ok: true,
       external_ref: o.external_ref,
-      status: normalizeStatus(o.status),
+      status: normalizeStatus(o.status), // já retorna "pago"
       amount: o.amount,
       merchant_order_id: o.merchant_order_id,
       payment_id: o.payment_id,
@@ -770,6 +789,7 @@ app.get('/order/status', async (req, res) => {
     return res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
+
 
 // /order/:externalRef — PG primeiro, fallback SQLite (legado)
 app.get('/order/:externalRef', async (req, res) => {
