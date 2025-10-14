@@ -1003,36 +1003,41 @@ app.post('/order/protect', async (req, res) => {
   }
 });
 
-// GET /secure/:token → valida token e redireciona para o app (agora com externalRef)
-app.get('/secure/:token', async (req, res) => {
+// =================== SECURE LINK: valida token e redireciona ===================
+// GET /secure/:token  → valida token, marca como usado e redireciona p/ /#/resultado?ext=...&t=...
+app.get('/secure/:token', (req, res) => {
   try {
     const token = String(req.params.token || '').trim();
-    if (!token) return res.status(400).send('token inválido');
+    if (!token) return res.status(400).json({ error: 'token ausente' });
 
-    const r = await pgPool.query(
-      `SELECT token, external_ref, expires_at, used_at
-         FROM secure_links
-        WHERE token = $1
-        LIMIT 1`,
-      [token]
-    );
-    const row = r.rows[0];
-    if (!row) return res.status(404).send('token não encontrado');
-    if (row.expires_at && new Date(row.expires_at) <= new Date()) return res.status(410).send('token expirado');
+    const row = db.prepare(`
+      SELECT token, external_ref AS externalRef, expires_at AS expiresAt, used_at AS usedAt
+      FROM secure_links
+      WHERE token = ?
+    `).get(token);
 
-    // opcional: consumo único
-    // if (row.used_at) return res.status(410).send('token já utilizado');
-    // await pgPool.query(`UPDATE secure_links SET used_at = NOW() WHERE token = $1`, [token]);
+    if (!row) return res.status(404).json({ error: 'token inválido' });
 
-    // 👉 redireciona com externalRef (o front já entende)
-    const appUrl = `${APP_BASE_URL}/#/resultado?externalRef=${encodeURIComponent(row.external_ref)}`;
-    res.setHeader('Cache-Control', 'no-store');
-    return res.redirect(302, appUrl);
+    const now = Date.now();
+    if (row.usedAt) return res.status(409).json({ error: 'token já utilizado' });
+    if (row.expiresAt && now > Number(row.expiresAt)) return res.status(410).json({ error: 'token expirado' });
+
+    db.prepare(`UPDATE secure_links SET used_at = ? WHERE token = ?`).run(now, token);
+
+    const APP = process.env.APP_BASE_URL || 'https://app.clicaipa.com.br';
+    const redirectUrl =
+      `${APP}/#/resultado?ext=${encodeURIComponent(row.externalRef)}&t=${encodeURIComponent(token)}`;
+
+    console.log('[SECURE] OK token=%s externalRef=%s → REDIRECT %s',
+      token, row.externalRef, redirectUrl);
+
+    return res.redirect(302, redirectUrl); // 302 evita cache de 301
   } catch (e) {
-    console.error('[GET /secure/:token] erro', e?.message || e);
-    return res.status(500).send('erro interno');
+    console.error('[SECURE] erro', e);
+    return res.status(500).json({ error: 'falha ao resolver token' });
   }
 });
+
 
 
 // (Opcional) GET /order/secure/:token → payload mínimo para o app
