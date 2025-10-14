@@ -976,14 +976,14 @@ app.post('/order/protect', async (req, res) => {
   }
 });
 
-// GET /secure/:token → valida e redireciona para o app com ?token=...
+// GET /secure/:token → valida token e redireciona para o app (agora com externalRef)
 app.get('/secure/:token', async (req, res) => {
   try {
     const token = String(req.params.token || '').trim();
     if (!token) return res.status(400).send('token inválido');
 
-    const r = await pool.query(
-      `SELECT token, expires_at, used_at
+    const r = await pgPool.query(
+      `SELECT token, external_ref, expires_at, used_at
          FROM secure_links
         WHERE token = $1
         LIMIT 1`,
@@ -993,16 +993,20 @@ app.get('/secure/:token', async (req, res) => {
     if (!row) return res.status(404).send('token não encontrado');
     if (row.expires_at && new Date(row.expires_at) <= new Date()) return res.status(410).send('token expirado');
 
-    // (opcional) consumo único:
-    // await pool.query(`UPDATE secure_links SET used_at = NOW() WHERE token = $1`, [token]);
+    // opcional: consumo único
+    // if (row.used_at) return res.status(410).send('token já utilizado');
+    // await pgPool.query(`UPDATE secure_links SET used_at = NOW() WHERE token = $1`, [token]);
 
+    // 👉 redireciona com externalRef (o front já entende)
+    const appUrl = `${APP_BASE_URL}/#/resultado?externalRef=${encodeURIComponent(row.external_ref)}`;
     res.setHeader('Cache-Control', 'no-store');
-    return res.redirect(302, appUrlForToken(token));
-  } catch (err) {
-    console.error('[GET /secure/:token] erro', err?.message || err);
+    return res.redirect(302, appUrl);
+  } catch (e) {
+    console.error('[GET /secure/:token] erro', e?.message || e);
     return res.status(500).send('erro interno');
   }
 });
+
 
 // (Opcional) GET /order/secure/:token → payload mínimo para o app
 app.get('/order/secure/:token', async (req, res) => {
@@ -1025,7 +1029,7 @@ app.get('/order/secure/:token', async (req, res) => {
       ok: true,
       token,
       externalRef: row.external_ref,
-      appUrl: appUrlForToken(token),
+      appUrl: `${APP_BASE_URL}/#/resultado?externalRef=${encodeURIComponent(row.external_ref)}`,
       expiresAt: new Date(row.expires_at).toISOString()
     });
   } catch (err) {
