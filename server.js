@@ -62,14 +62,16 @@ async function upsertOrderPg({
   ]);
 }
 
-// Normalizador de status (padrão: approved/pending/rejected)
+
+// Normalizador de status (front espera 'pago' para aprovado)
 function normalizeStatus(s) {
   const v = String(s || '').toLowerCase();
-  if (['approved', 'pago', 'accredited', 'closed'].includes(v)) return 'approved';
+  if (['approved', 'pago', 'accredited', 'closed'].includes(v)) return 'pago';
   if (['pending', 'aguardando', 'in_process', 'in mediation'].includes(v)) return 'pending';
   if (['rejected', 'cancelled', 'canceled'].includes(v)) return 'rejected';
   return v || 'pending';
 }
+
 
 // === Helpers de Link Protegido (PostgreSQL) — UNIFICADO ===
 const pool = pgPool; // reaproveita pool criado acima
