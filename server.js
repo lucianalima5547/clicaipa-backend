@@ -634,19 +634,40 @@ app.post('/order/save', (req, res) => {
   return res.json({ ok: true });
 });
 
-// /order/selections — PG primeiro; fallback SQLite/memória
+// /order/selections — aceita externalRef ou token e sempre retorna cardapios “seguros”
 app.get('/order/selections', async (req, res) => {
   try {
+    // 0) externalRef direto
     let externalRef =
       req.query.externalRef ||
       req.query.external_ref ||
       req.query.external_reference || '';
 
-    if (Array.isArray(externalRef)) externalRef = externalRef[0];
-    externalRef = String(externalRef || '').trim();
-    if (!externalRef) return res.status(400).json({ error: 'externalRef é obrigatório' });
+    // 1) se não veio, resolve via token
+    if (!externalRef && req.query.token) {
+      const tok = String(req.query.token).trim();
+      if (tok) {
+        try {
+          const rTok = await pgPool.query(
+            `select external_ref
+               from secure_links
+              where token = $1
+                and (expires_at is null or expires_at > now())
+              limit 1`,
+            [tok]
+          );
+          if (rTok.rows.length) externalRef = rTok.rows[0].external_ref;
+        } catch (e) {
+          console.warn('[SELECTIONS][PG token] warn:', e.message);
+        }
+      }
+    }
 
-    // 1) PG
+    if (!externalRef) {
+      return res.status(400).json({ error: 'externalRef ou token é obrigatório' });
+    }
+
+    // 2) PG primeiro
     let pgRow = null;
     try {
       const r = await pgPool.query(
@@ -662,11 +683,11 @@ app.get('/order/selections', async (req, res) => {
     }
 
     // base PG
-    let status = pgRow?.status || null;
+    let status = pgRow?.status ?? null;
     let amount = pgRow?.amount ?? null;
-    let payload = (pgRow && pgRow.payload) ? pgRow.payload : null;
+    let payload = pgRow?.payload ?? null;
 
-    // 2) Mem/SQLite
+    // 3) Mem/SQLite (legado) para fallback
     const mem = ordersStatus.get(externalRef) || {};
     const sqliteRow = db.prepare(
       `SELECT status, amount, selections, cardapios
@@ -674,30 +695,34 @@ app.get('/order/selections', async (req, res) => {
         WHERE external_ref = ?`
     ).get(externalRef) || null;
 
-    function parseJSON(raw) {
+    const parseJSON = (raw) => {
       try { return raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : null; }
       catch { return null; }
-    }
+    };
 
-    const selFromPg  = payload?.selections ? payload.selections : null;
-    const selFromMem = parseJSON(mem.selections) || mem.selections || null;
-    const selFromSql = parseJSON(sqliteRow?.selections) || null;
+    const selections =
+      (payload && payload.selections) ||
+      parseJSON(mem.selections) ||
+      parseJSON(sqliteRow?.selections) ||
+      {};
 
-    const selections = selFromPg || selFromMem || selFromSql || {};
+    const cardapiosRaw =
+      (payload && payload.cardapios) ||
+      mem.cardapios ||
+      parseJSON(sqliteRow?.cardapios) ||
+      [];
 
-    const cardFromPg  = payload?.cardapios ? payload.cardapios : null;
-    const cardFromMem = mem.cardapios || null;
-    const cardFromSql = parseJSON(sqliteRow?.cardapios) || null;
-
-    const cardapiosRaw = cardFromPg || cardFromMem || cardFromSql || [];
-    const safeCardapios = Array.isArray(cardapiosRaw) && cardapiosRaw.length
+    // 🔒 SEMPRE devolve array não-vazio
+    const cardapios = Array.isArray(cardapiosRaw) && cardapiosRaw.length
       ? cardapiosRaw
       : [{ titulo: 'Cardápio em preparação', receitas: [] }];
 
     if (status == null) status = mem.status || sqliteRow?.status || 'pending';
-    if (amount == null) amount = (typeof mem.amount === 'number') ? mem.amount
-                      : (typeof sqliteRow?.amount === 'number') ? sqliteRow.amount
-                      : null;
+    if (amount == null) {
+      amount = (typeof mem.amount === 'number') ? mem.amount
+              : (typeof sqliteRow?.amount === 'number') ? sqliteRow.amount
+              : null;
+    }
 
     const arr = (x) => Array.isArray(x) ? x : [];
     const modo = (String((selections?.modo ?? 'congelado')).toLowerCase() === 'semanal') ? 'semanal' : 'congelado';
@@ -707,6 +732,7 @@ app.get('/order/selections', async (req, res) => {
           ? Math.max(1, parseInt(selections?.pessoas, 10) || 1)
           : 24);
 
+    // ✅ resposta única, sem returns duplicados
     return res.json({
       externalRef,
       amount: amount ?? null,
@@ -719,8 +745,8 @@ app.get('/order/selections', async (req, res) => {
       },
       modo,
       quantidade,
-      status: normalizeStatus(status),
-      cardapios: safeCardapios,
+      status: normalizeStatus(status),  // já retorna “pago”
+      cardapios,
       source: pgRow ? (payload ? 'pg' : 'pg+sqlite') : (sqliteRow ? 'sqlite' : 'mem')
     });
   } catch (e) {
@@ -728,6 +754,7 @@ app.get('/order/selections', async (req, res) => {
     return res.status(500).json({ error: 'erro interno' });
   }
 });
+
 
 // /order/status — agora aceita ?token=... (resolve para external_ref via secure_links)
 app.get('/order/status', async (req, res) => {
