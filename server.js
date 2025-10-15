@@ -266,24 +266,36 @@ app.get('/health', (_req, res) => res.status(200).send('ok'));
 /* ======================== SQLite (LEGADO / COMPAT) ======================== */
 const db = new Database(path.join(__dirname, 'data.sqlite'));
 db.pragma('journal_mode = WAL');
+db.pragma('synchronous = NORMAL');
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS orders (
-    external_ref TEXT PRIMARY KEY,
-    status       TEXT NOT NULL,
-    amount       REAL,
-    merchant_order_id TEXT,
-    payment_id   TEXT,
-    paid_at      TEXT,
-    selections   TEXT,
-    cardapios    TEXT,
-    secure_token  TEXT,
-    secure_expiry INTEGER,
-    secure_used   INTEGER DEFAULT 0,
-    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+    external_ref       TEXT PRIMARY KEY,
+    status             TEXT NOT NULL,
+    amount             REAL,
+    merchant_order_id  TEXT,
+    payment_id         TEXT,
+    paid_at            TEXT,
+    selections         TEXT,
+    cardapios          TEXT,
+    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at         TEXT NOT NULL DEFAULT (datetime('now'))
   );
-  CREATE INDEX IF NOT EXISTS idx_orders_secure_token ON orders(secure_token);
+
+  -- Índices úteis para relatórios/listagens
+  CREATE INDEX IF NOT EXISTS idx_orders_updated_at ON orders (updated_at);
+  CREATE INDEX IF NOT EXISTS idx_orders_status     ON orders (status);
+
+  -- Trigger para manter updated_at SEMPRE que atualizar
+  CREATE TRIGGER IF NOT EXISTS trg_orders_updated_at
+  AFTER UPDATE ON orders
+  FOR EACH ROW
+  BEGIN
+    UPDATE orders SET updated_at = datetime('now') WHERE external_ref = NEW.external_ref;
+  END;
 `);
+
+
 const upsertBase = db.prepare(`
   INSERT INTO orders (external_ref, status, amount, selections, cardapios, created_at, updated_at)
   VALUES (@external_ref, @status, @amount, @selections, @cardapios, datetime('now'), datetime('now'))
@@ -953,36 +965,6 @@ app.get('/pg/protect', async (req, res) => {
   }
 });
 
-// === Consumir token protegido (PG) — redireciona com ?token=...
-app.get('/secure_pg/:token', async (req, res) => {
-  try {
-    const token = String(req.params.token || '').trim();
-    if (!token) return res.status(400).send('token ausente');
-
-    const sel = await pgPool.query(
-      `select external_ref, expires_at, used_at
-         from secure_links
-        where token = $1
-        limit 1`,
-      [token]
-    );
-    if (!sel.rows.length) return res.status(404).send('token inválido');
-
-    const row = sel.rows[0];
-    if (row.expires_at && new Date(row.expires_at) < new Date()) return res.status(410).send('token expirado');
-
-    // Se quiser consumo único, descomente:
-    // await pgPool.query(`update secure_links set used_at = NOW() where token = $1`, [token]);
-
-    const appUrl = `${APP_BASE_URL}/#/resultado?token=${encodeURIComponent(token)}`;
-    res.setHeader('Cache-Control', 'no-store');
-    return res.redirect(302, appUrl);
-  } catch (e) {
-    console.error('[PG] /secure_pg erro:', e?.message || e);
-    return res.status(500).send('erro interno');
-  }
-});
-
 // ================== ROTAS OFICIAIS DE LINK PROTEGIDO ==================
 
 // POST /order/protect → cria/reusa token para pedido pago (PG)
@@ -1003,40 +985,82 @@ app.post('/order/protect', async (req, res) => {
   }
 });
 
-// =================== SECURE LINK: valida token e redireciona ===================
-// GET /secure/:token  → valida token, marca como usado e redireciona p/ /#/resultado?ext=...&t=...
-app.get('/secure/:token', (req, res) => {
+
+
+
+// (1) JSON: resolve token → externalRef  (vem PRIMEIRO!)
+app.get('/secure/resolve', async (req, res) => {
+  try {
+    const token = String(req.query.token || '').trim();
+    const consume = String(req.query.consume || '').trim() === '1';
+    if (!token) return res.status(400).json({ ok:false, error:'token_ausente' });
+
+    const { rows } = await pgPool.query(
+      `select external_ref, expires_at, used_at
+         from secure_links
+        where token = $1
+        limit 1`,
+      [token]
+    );
+    if (!rows.length) return res.status(404).json({ ok:false, error:'token_invalido' });
+
+    const row = rows[0];
+    const now = new Date();
+    if (row.expires_at && new Date(row.expires_at) <= now) {
+      return res.status(410).json({ ok:false, error:'token_expirado' });
+    }
+    if (consume) {
+      if (row.used_at) return res.status(409).json({ ok:false, error:'token_usado' });
+      await pgPool.query(`update secure_links set used_at = now() where token = $1 and used_at is null`, [token]);
+    }
+    return res.json({
+      ok: true,
+      externalRef: row.external_ref,
+      expiresAt: row.expires_at ? new Date(row.expires_at).toISOString() : null,
+      usedAt: row.used_at ? new Date(row.used_at).toISOString() : null
+    });
+  } catch (e) {
+    console.error('[SECURE][resolve] erro:', e?.message || e);
+    return res.status(500).json({ ok:false, error:'falha_interna' });
+  }
+});
+
+
+// (2) REDIRECT: /secure/:token  (vem DEPOIS!)
+app.get('/secure/:token', async (req, res) => {
   try {
     const token = String(req.params.token || '').trim();
     if (!token) return res.status(400).json({ error: 'token ausente' });
 
-    const row = db.prepare(`
-      SELECT token, external_ref AS externalRef, expires_at AS expiresAt, used_at AS usedAt
-      FROM secure_links
-      WHERE token = ?
-    `).get(token);
+    const { rows } = await pgPool.query(
+      `select external_ref, expires_at, used_at
+         from secure_links
+        where token = $1
+        limit 1`,
+      [token]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'token inválido' });
 
-    if (!row) return res.status(404).json({ error: 'token inválido' });
+    const row = rows[0];
+    if (row.expires_at && new Date(row.expires_at) <= new Date()) {
+      return res.status(410).json({ error: 'token expirado' });
+    }
 
-    const now = Date.now();
-    if (row.usedAt) return res.status(409).json({ error: 'token já utilizado' });
-    if (row.expiresAt && now > Number(row.expiresAt)) return res.status(410).json({ error: 'token expirado' });
+    // consumo único (opcional)
+    await pgPool.query(`update secure_links set used_at = now() where token = $1 and used_at is null`, [token]);
 
-    db.prepare(`UPDATE secure_links SET used_at = ? WHERE token = ?`).run(now, token);
-
-    const APP = process.env.APP_BASE_URL || 'https://app.clicaipa.com.br';
-    const redirectUrl =
-      `${APP}/#/resultado?ext=${encodeURIComponent(row.externalRef)}&t=${encodeURIComponent(token)}`;
-
-    console.log('[SECURE] OK token=%s externalRef=%s → REDIRECT %s',
-      token, row.externalRef, redirectUrl);
-
-    return res.redirect(302, redirectUrl); // 302 evita cache de 301
+    // prefira ?token=... para o app resolver (ou troque por externalRef se quiser)
+    const redirectUrl = `${APP_BASE_URL}/#/resultado?token=${encodeURIComponent(token)}`;
+    console.log('[SECURE][PG] OK token=%s → %s', token, redirectUrl);
+    res.setHeader('Cache-Control', 'no-store');
+    return res.redirect(302, redirectUrl);
   } catch (e) {
-    console.error('[SECURE] erro', e);
+    console.error('[SECURE][PG] erro', e?.message || e);
     return res.status(500).json({ error: 'falha ao resolver token' });
   }
 });
+
+
 
 
 
