@@ -568,63 +568,74 @@ app.post('/webhook', express.json(), async (req, res) => {
   }
 });
 
-/* ======================== /retorno (MP → aprovado) ======================== */
+// --- Dependências necessárias no topo ---
+// const crypto = require('crypto'); // você já tem
+// const Database = require('better-sqlite3'); // você já tem
+// const express = require('express'); // etc.
+
+// 🔧 garanta a tabela (idempotente)
+function ensureSecureLinksTable(db) {
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS secure_links (
+      token TEXT PRIMARY KEY,
+      external_ref TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      used_at TEXT
+    )
+  `).run();
+}
+
+// 🔑 cria token + persiste + monta URL de retorno
+function createSecureLinkForOrder(db, externalRef, { hours = 24 } = {}) {
+  const token = crypto.randomBytes(24).toString('base64url');
+  const expiresAt = new Date(Date.now() + hours * 3600 * 1000).toISOString();
+
+  db.prepare(`
+    INSERT INTO secure_links (token, external_ref, expires_at, used_at)
+    VALUES (?, ?, ?, NULL)
+  `).run(token, externalRef, expiresAt);
+
+  const appBase = process.env.APP_BASE_URL || 'https://app.clicaipa.com.br';
+  const url = `${appBase}/#/resultado?token=${token}`;
+  return { token, url, expiresAt };
+}
+
+// ✅ Handler de retorno do MP (success/pending)
 app.get('/retorno', async (req, res) => {
-  const q = req.query || {};
-  const statusQ = String(q.status || '').toLowerCase();
-  const externalRef = q.external_ref || q.externalRef || q.external_reference || '';
-  const ext = String(externalRef || '').trim();
-  if (!ext) return res.status(400).send('<h3>external_ref ausente</h3>');
-
-  // checa status confirmado (mem/sqlite) apenas para mensagem amigável
-  const mem = ordersStatus.get(ext) || {};
-  const row = db.prepare('SELECT status FROM orders WHERE external_ref = ?').get(ext) || {};
-
-  const statusMem = String(mem.status || '').toLowerCase();
-  const statusDb  = String(row.status || '').toLowerCase();
-  const isApproved =
-    statusQ === 'approved' ||
-    ['approved','pago','accredited','closed'].includes(statusMem) ||
-    ['approved','pago','accredited','closed'].includes(statusDb);
-
-  if (!isApproved) {
-    const continueUrl =
-      mem.checkout_url ||
-      (mem.preference_id ? `https://www.mercadopago.com.br/checkout/v1/redirect?pref_id=${mem.preference_id}` : null);
-
-    res.setHeader('Cache-Control', 'no-store');
-    return res.status(200).send(`<!doctype html>
-<html lang="pt-br"><head><meta charset="utf-8"><title>Pagamento não concluído</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial; padding:24px; color:#222;}
-.btn{display:inline-block;padding:10px 14px;background:#0a7;color:#fff;text-decoration:none;border-radius:8px}
-.card{background:#f7f7f7;border-radius:12px;padding:16px;margin-top:12px}
-.small{color:#666;font-size:12px}
-</style></head><body>
-  <h2>Pagamento não concluído</h2>
-  <div class="card">
-    <p>Status atual: <b>${statusQ || 'desconhecido'}</b>.</p>
-    <p>Você pode retornar ao checkout para concluir o pagamento.</p>
-    ${continueUrl ? `<p><a class="btn" href="${continueUrl}">Voltar ao pagamento</a></p>` : `<p class="small">Link de retorno indisponível.</p>`}
-    <p class="small">Ref.: ${ext}</p>
-  </div>
-</body></html>`);
-  }
-
-  // Gera/usa token PROTEGIDO no Postgres (unificado)
   try {
-    const out = await createOrReuseSecureLinkForOrderPgUnified(ext);
-    const secureUrl = out.secureUrl; // PUBLIC_BASE_URL/secure/:token
-    res.setHeader('Cache-Control', 'no-store');
-    return res.redirect(302, secureUrl);
+    const status = String(req.query.status || '').toLowerCase();
+    const ext =
+      String(
+        req.query.external_ref ||
+          req.query.externalRef ||
+          req.query.external_reference ||
+          ''
+      ).trim();
+
+    if (!ext) {
+      return res.status(400).send('external_ref ausente no retorno.');
+    }
+
+    // (Opcional) Se quiser: marque status "pago/approved" aqui no pedido
+    // if (status === 'approved' || status === 'pago' || status === 'accredited') {
+    //   db.prepare('UPDATE orders SET status = ? WHERE external_ref = ?')
+    //     .run('pago', ext);
+    // }
+
+    ensureSecureLinksTable(db);
+    const { url } = createSecureLinkForOrder(db, ext, { hours: 24 });
+
+    // (Opcional) disparar e-mail com o link:
+    // await sendSecureLinkEmailToBuyer(ext, url);
+
+    // 🔁 Redireciona o cliente diretamente para o app com ?token=
+    return res.redirect(302, url);
   } catch (e) {
-    console.error('[RETORNO] falha ao criar token PG, fallback para app com externalRef', e?.message || e);
-    const appUrl = `${APP_BASE_URL}/#/resultado?externalRef=${encodeURIComponent(ext)}`;
-    res.setHeader('Cache-Control', 'no-store');
-    return res.redirect(302, appUrl);
+    console.error('[RETORNO][ERR]', e);
+    return res.status(500).send('Erro ao processar retorno.');
   }
 });
+
 
 /* ======================== Salvar/Buscar Cardápios ======================== */
 app.post('/order/save', (req, res) => {
