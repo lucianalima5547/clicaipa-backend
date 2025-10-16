@@ -96,10 +96,14 @@ ensureSecureLinksTableUnified()
 function makeUrlSafeToken() {
   return crypto.randomBytes(24).toString('base64url'); // seguro p/ URL
 }
-function appUrlForToken(token) {
+
+function appUrlForToken(externalRef) {
   const base = process.env.APP_BASE_URL || 'https://app.clicaipa.com.br';
-  return `${base}/#/resultado?token=${token}`;
+  return `${base}/#/resultado?externalRef=${encodeURIComponent(externalRef)}`;
 }
+
+
+
 function secureUrlForToken(token) {
   const base = (process.env.PUBLIC_BASE_URL || 'https://api.clicaipa.com.br').replace(/\/+$/,'');
   return `${base}/secure/${token}`;
@@ -136,7 +140,8 @@ async function createOrReuseSecureLinkForOrderPgUnified(externalRef) {
       ok: true,
       token,
       secureUrl: secureUrlForToken(token),
-      appUrl: appUrlForToken(token),
+      //appUrl: appUrlForToken(token),
+      appUrl: appUrlForToken(externalRef),
       expiresAt: new Date(expires_at).toISOString(),
       reused: true
     };
@@ -155,7 +160,8 @@ async function createOrReuseSecureLinkForOrderPgUnified(externalRef) {
     ok: true,
     token,
     secureUrl: secureUrlForToken(token),
-    appUrl: appUrlForToken(token),
+    //appUrl: appUrlForToken(token),
+    appUrl: appUrlForToken(externalRef),
     expiresAt: new Date(expiresAt).toISOString(),
     reused: false
   };
@@ -378,8 +384,8 @@ app.post('/create_preference', async (req, res) => {
       return res.status(400).json({ error: 'unit_price inválido' });
     }
 
-    const _modo = (String(modo).toLowerCase() === 'semanal') ? 'semanal' : 'congelado';
-    const resolvedQuantidade =
+      const _modo = (String(modo).toLowerCase() === 'semanal') ? 'semanal' : 'congelado';
+      const resolvedQuantidade =
       Number.isFinite(quantidade) ? Number(quantidade) :
       Number.isFinite(quantidadeTotal) ? Number(quantidadeTotal) :
       Number.isFinite(quantityTotal) ? Number(quantityTotal) :
@@ -402,6 +408,10 @@ app.post('/create_preference', async (req, res) => {
       metadata: { source: 'clicaipa-app' },
       payment_methods: { excluded_payment_methods: [], excluded_payment_types: [], default_payment_method_id: 'pix' },
     };
+
+console.log('[PREFERENCE][BACK_URLS]', body.back_urls, 'extRef=', resolvedOrderId);
+
+
 
     const mpRes = await pref.create({ body });
     const preferenceId = mpRes?.id || mpRes?.body?.id || null;
@@ -595,46 +605,39 @@ function createSecureLinkForOrder(db, externalRef, { hours = 24 } = {}) {
     VALUES (?, ?, ?, NULL)
   `).run(token, externalRef, expiresAt);
 
+  // 🔁 Redirect baseado em externalRef (rollback do link protegido)
   const appBase = process.env.APP_BASE_URL || 'https://app.clicaipa.com.br';
-  const url = `${appBase}/#/resultado?token=${token}`;
+  const url = `${appBase}/#/resultado?externalRef=${encodeURIComponent(externalRef)}`;
+
   return { token, url, expiresAt };
 }
+
 
 // ✅ Handler de retorno do MP (success/pending)
 app.get('/retorno', async (req, res) => {
   try {
     const status = String(req.query.status || '').toLowerCase();
-    const ext =
-      String(
-        req.query.external_ref ||
-          req.query.externalRef ||
-          req.query.external_reference ||
-          ''
-      ).trim();
+    const ext = String(
+      req.query.external_ref ||
+      req.query.externalRef ||
+      req.query.external_reference ||
+      ''
+    ).trim();
 
-    if (!ext) {
-      return res.status(400).send('external_ref ausente no retorno.');
-    }
+    if (!ext) return res.status(400).send('external_ref ausente no retorno.');
 
-    // (Opcional) Se quiser: marque status "pago/approved" aqui no pedido
-    // if (status === 'approved' || status === 'pago' || status === 'accredited') {
-    //   db.prepare('UPDATE orders SET status = ? WHERE external_ref = ?')
-    //     .run('pago', ext);
-    // }
+    // 🔁 REDIRECT FORÇADO POR externalRef (sem token)
+    const appBase = process.env.APP_BASE_URL || 'https://app.clicaipa.com.br';
+    const url = `${appBase}/#/resultado?externalRef=${encodeURIComponent(ext)}`;
 
-    ensureSecureLinksTable(db);
-    const { url } = createSecureLinkForOrder(db, ext, { hours: 24 });
-
-    // (Opcional) disparar e-mail com o link:
-    // await sendSecureLinkEmailToBuyer(ext, url);
-
-    // 🔁 Redireciona o cliente diretamente para o app com ?token=
+    console.log('[RETORNO][REDIRECT-FORCED]', { ext, status, url });
     return res.redirect(302, url);
   } catch (e) {
     console.error('[RETORNO][ERR]', e);
     return res.status(500).send('Erro ao processar retorno.');
   }
 });
+
 
 
 /* ======================== Salvar/Buscar Cardápios ======================== */
@@ -1061,8 +1064,8 @@ app.get('/secure/:token', async (req, res) => {
     await pgPool.query(`update secure_links set used_at = now() where token = $1 and used_at is null`, [token]);
 
     // prefira ?token=... para o app resolver (ou troque por externalRef se quiser)
-    const redirectUrl = `${APP_BASE_URL}/#/resultado?token=${encodeURIComponent(token)}`;
-    console.log('[SECURE][PG] OK token=%s → %s', token, redirectUrl);
+    const redirectUrl = `${APP_BASE_URL}/#/resultado?externalRef=${encodeURIComponent(row.external_ref)}`;
+    console.log('[SECURE][REDIRECT]', { token, externalRef: row.external_ref, redirectUrl });
     res.setHeader('Cache-Control', 'no-store');
     return res.redirect(302, redirectUrl);
   } catch (e) {
