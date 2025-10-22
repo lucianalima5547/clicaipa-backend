@@ -5,13 +5,14 @@ yarn-error.log*
 .idea/
 .vscode/
 
-# não versionar builds locais
+# builds locais
 build/
 dist/
 
-# não versionar chaves/segredos
+# segredos
+.env
 keys/*.json
 
-# lockfiles (se seu deploy não exige, melhor não versionar)
+# lockfiles (se seu deploy não exige)
 package-lock.json
 yarn.lock
