@@ -1,0 +1,17 @@
+﻿node_modules/
+npm-debug.log*
+yarn-error.log*
+.DS_Store
+.idea/
+.vscode/
+
+# não versionar builds locais
+build/
+dist/
+
+# não versionar chaves/segredos
+keys/*.json
+
+# lockfiles (se seu deploy não exige, melhor não versionar)
+package-lock.json
+yarn.lock
