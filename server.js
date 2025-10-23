@@ -225,10 +225,6 @@ async function mpGet(pathname) { const { data } = await MP_HTTP.get(pathname); r
 
 app.set('trust proxy', true);
 
-
-
-const path = require('path');
-
 // 1) Arquivos estáticos do Flutter Web (cache longo p/ assets hasheados)
 app.use(express.static(path.join(__dirname, 'public'), {
   setHeaders: (res, filePath) => {
