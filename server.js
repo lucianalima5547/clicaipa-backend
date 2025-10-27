@@ -134,17 +134,6 @@ async function mpGet(pathname) { const { data } = await MP_HTTP.get(pathname); r
 app.set('trust proxy', true);
 
 
-// ======== Tampão /secure → redireciona para Resultado por externalRef ========
-app.get(['/secure/:token', '/secure', '/secure/'], (req, res) => {
-  const APP_BASE_URL = process.env.APP_BASE_URL || 'https://app.clicaipa.com.br';
-  const ext = (req.query.externalRef || req.query.external_ref || '').toString().trim();
-  if (ext) {
-    return res.redirect(302, `${APP_BASE_URL}/#/resultado?externalRef=${encodeURIComponent(ext)}`);
-  }
-  // Sem externalRef → manda para Resultado genérica (a tela se vira para avisar)
-  return res.redirect(302, `${APP_BASE_URL}/#/resultado`);
-});
-
 
 // 1) Arquivos estáticos do Flutter Web (cache longo p/ assets hasheados)
 app.use(express.static(path.join(__dirname, 'public'), {
