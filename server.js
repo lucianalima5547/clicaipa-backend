@@ -37,6 +37,21 @@ pgPool
   .then(() => console.log('[PG] conectado com sucesso'))
   .catch((err) => console.error('[PG] erro de conexão:', err.message));
 
+
+const crypto = require('crypto');
+
+function genSecureToken() {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
+function hashSecureToken(token) {
+  const secret = process.env.SECURE_LINK_SECRET || '';
+  const h = crypto.createHmac('sha256', secret);
+  h.update(token);
+  return h.digest('hex');
+}
+
+
 // === Helper: upsert no PostgreSQL ===
 async function upsertOrderPg({
   external_ref, status, amount = null,
@@ -182,6 +197,15 @@ app.options(/.*/, cors(corsOptions));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
+
+app.use((req, _res, next) => {
+  try {
+    console.log('[REQ]', req.method, req.path);
+  } catch (_) {}
+  next();
+});
+
+
 /* ======================== HEALTH ======================== */
 app.get('/ping', (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 app.get('/', (_req, res) => res.send('OK – Clicaipá backend no ar'));
@@ -273,6 +297,8 @@ function extractExternalRef(req) {
   } catch (_) {}
   return '';
 }
+
+
 
 /* ======================== Create Preference (somente externalRef) ======================== */
 app.post('/create_preference', async (req, res) => {
@@ -570,24 +596,60 @@ app.get('/retorno', (req, res) => {
 });
 
 /* ======================== Salvar/Buscar Cardápios ======================== */
-app.post('/order/save', (req, res) => {
-  const { externalRef, cardapios } = req.body || {};
-  if (!externalRef || !cardapios) return res.status(400).json({ error: 'externalRef e cardapios são obrigatórios' });
+// Salvar/Atualizar Cardápios — grava em Memória, SQLite e **PG**
+app.post('/order/save', async (req, res) => {
+  try {
+    const { externalRef, cardapios } = req.body || {};
+    if (!externalRef || !cardapios) {
+      return res.status(400).json({ error: 'externalRef e cardapios são obrigatórios' });
+    }
 
-  const prev = ordersStatus.get(externalRef) || {};
-  const merged = { ...prev, cardapios };
-  ordersStatus.set(externalRef, merged);
+    // 1) Merge em memória
+    const prevMem = ordersStatus.get(externalRef) || {};
+    const mergedMem = { ...prevMem, cardapios };
+    ordersStatus.set(externalRef, mergedMem);
 
-  upsertBase.run({
-    external_ref: externalRef,
-    status: prev.status || 'aguardando',
-    amount: prev.amount || 0,
-    selections: JSON.stringify(prev.selections || {}),
-    cardapios: JSON.stringify(cardapios),
-  });
+    // 2) SQLite (legado/compat)
+    upsertBase.run({
+      external_ref: externalRef,
+      status: prevMem.status || 'aguardando',
+      amount: prevMem.amount || 0,
+      selections: JSON.stringify(prevMem.selections || {}),
+      cardapios: JSON.stringify(cardapios),
+    });
 
-  return res.json({ ok: true });
+    // 3) Postgres (fonte que o /order/selections prioriza)
+    try {
+      // busca payload atual do PG p/ preservar selections existentes
+      let payloadPg = null;
+      try {
+        const r = await pgPool.query(
+          `select payload from orders where external_ref = $1 limit 1`,
+          [externalRef]
+        );
+        if (r.rows.length) payloadPg = r.rows[0].payload || null;
+      } catch (_) {}
+
+      const selectionsPg = payloadPg?.selections || prevMem.selections || {};
+
+      await upsertOrderPg({
+        external_ref: externalRef,
+        status: prevMem.status || 'aguardando',
+        amount: prevMem.amount || 0,
+        selections: JSON.stringify(selectionsPg),
+        cardapios: JSON.stringify(cardapios),
+      });
+    } catch (e) {
+      console.warn('[PG][order/save] upsert warn:', e?.message || e);
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[ORDER/SAVE][ERR]', e?.message || e);
+    return res.status(500).json({ error: 'erro interno' });
+  }
 });
+
 
 // /order/selections — SOMENTE externalRef
 app.get('/order/selections', async (req, res) => {
@@ -843,26 +905,78 @@ app.get('/pg/status', async (req, res) => {
   }
 });
 
-// POST /order/protect — SOMENTE externalRef (sem token, sem secure_links)
+// POST /order/protect  → body: { externalRef: "PED-...", email?: "..." }
 app.post('/order/protect', async (req, res) => {
   try {
-    const externalRef = extractExternalRef(req);
-    if (!externalRef) {
-      return res.status(400).json({ error: 'externalRef ausente' });
-    }
+    const externalRef = String(req.body?.externalRef || req.query?.externalRef || '').trim();
+    const email = (req.body?.email || req.query?.email || '').trim() || null;
+    if (!externalRef) return res.status(400).json({ error: 'externalRef ausente' });
 
-    // (Opcional) validação de pedido pago no PG
-    // const ord = await pgPool.query(`select status from orders where external_ref=$1 limit 1`, [externalRef]);
-    // const status = ord.rows[0]?.status || 'pending';
-    // if (normalizeStatus(status) !== 'pago') return res.status(403).json({ error: 'pedido não liberado' });
+    // (opcional) valide se o pedido existe e está aprovado
+    // const { rows: ord } = await pgPool.query('select status from orders where external_ref = $1 limit 1', [externalRef]);
+    // if (!ord.length || ord[0].status !== 'approved') return res.status(403).json({ error: 'pedido não aprovado' });
 
-    const appUrl = `${APP_BASE_URL}/#/resultado?externalRef=${encodeURIComponent(externalRef)}`;
-    return res.json({ ok: true, externalRef, url: appUrl, liberated: true });
+    const token = genSecureToken();
+    const tokenHash = hashSecureToken(token);
+
+    // expira em 7 dias; ajuste se quiser
+    await pgPool.query(
+      `insert into secure_links (external_ref, token_hash, expires_at, email, notes)
+       values ($1, $2, now() + interval '7 days', $3, $4)`,
+      [externalRef, tokenHash, email, 'criado via /order/protect']
+    );
+
+    const base = process.env.PUBLIC_BASE_URL || 'http://localhost:10000';
+    const secureUrl = `${base}/secure/${token}`;
+
+console.log('[ORDER/PROTECT]',
+  { externalRef, email, secureUrl,
+    ip: req.headers['x-forwarded-for'] || req.socket?.remoteAddress });
+
+
+    // (envio de e-mail virá em passo posterior)
+    return res.json({ ok: true, secureUrl, externalRef });
   } catch (err) {
-    console.error('[PROTECT][ERR]', err);
+    console.error('[order/protect] erro:', err);
     return res.status(500).json({ error: 'erro interno' });
   }
 });
+
+// GET /secure/:token → redireciona para APP/#/resultado?externalRef=...
+app.get('/secure/:token', async (req, res) => {
+  try {
+    const token = String(req.params.token || '').trim();
+    if (!token) return res.status(400).json({ error: 'token ausente' });
+
+    const tokenHash = hashSecureToken(token);
+    const { rows } = await pgPool.query(
+      `select external_ref, expires_at, used_at
+         from secure_links
+        where token_hash = $1
+        limit 1`,
+      [tokenHash]
+    );
+
+    if (!rows.length) return res.status(404).json({ error: 'token inválido' });
+
+    const row = rows[0];
+    if (row.expires_at && new Date(row.expires_at) <= new Date()) {
+      return res.status(410).json({ error: 'token expirado' });
+    }
+
+    // (opcional) consumo único: descomente para marcar uso
+    // await pgPool.query(`update secure_links set used_at = now() where token_hash = $1 and used_at is null`, [tokenHash]);
+
+    const appBase = process.env.APP_BASE_URL || 'http://localhost:5173';
+    const redirectUrl = `${appBase}/#/resultado?externalRef=${encodeURIComponent(row.external_ref)}`;
+
+    return res.redirect(302, redirectUrl);
+  } catch (err) {
+    console.error('[secure/:token] erro:', err);
+    return res.status(500).json({ error: 'erro interno' });
+  }
+});
+
 
 // 2) SPA fallback: qualquer GET não-API volta para index.html
 app.use((req, res, next) => {
